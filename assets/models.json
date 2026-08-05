@@ -1,0 +1,155 @@
+{
+  "registry_version": 1,
+  "note": "Curated model registry for Monatomic. The app merges this with live Hugging Face listings (hf_search queries below) so new community models appear automatically. perf model: est_rt_factor = hw_tflops_effective / (params_m * arch_cost). arch_cost reflects architecture efficiency; arch_future_gain projects speedup available from known upcoming optimizations (flash-attention style kernels, int8/int4 quant, sparsity) not yet applied to the shipped file.",
+
+  "hf_search": {
+    "stems": [
+      { "query": "demucs onnx", "pipeline": "audio-to-audio" },
+      { "query": "music source separation onnx", "pipeline": null },
+      { "query": "bs-roformer", "pipeline": null },
+      { "query": "mel-band-roformer", "pipeline": null }
+    ],
+    "depth": [
+      { "query": "depth-anything onnx", "pipeline": "depth-estimation" },
+      { "query": "midas onnx", "pipeline": "depth-estimation" },
+      { "query": "depth estimation onnx", "pipeline": "depth-estimation" }
+    ]
+  },
+
+  "models": [
+    {
+      "id": "htdemucs-6s",
+      "kind": "stems",
+      "name": "HTDemucs 6-stem",
+      "vendor": "Meta AI",
+      "file": "htdemucs_6s.onnx",
+      "bundled": true,
+      "hf_repo": null,
+      "size_mb": 136,
+      "params_m": 42,
+      "stems": ["drums", "bass", "other", "vocals", "guitar", "piano"],
+      "quality": { "tier": "high", "sdr_db": 6.3, "notes": "Hybrid transformer; the 6-source variant trades ~0.3 dB vs 4s FT for guitar+piano stems." },
+      "arch": "hybrid-transformer", "arch_cost": 1.0, "arch_future_gain": 1.8,
+      "requirements": { "min_vram_gb": 2, "recommended_vram_gb": 4, "cpu_realtime": false, "fp16": true },
+      "io": { "input": "mix f32 [1,2,343980] @44.1kHz", "output": "[1,6,2,343980]" }
+    },
+    {
+      "id": "htdemucs-ft-4s",
+      "kind": "stems",
+      "name": "HTDemucs FT 4-stem",
+      "vendor": "Meta AI",
+      "file": "htdemucs_ft.onnx",
+      "bundled": false,
+      "hf_repo": "search:htdemucs ft onnx",
+      "size_mb": 316,
+      "params_m": 84,
+      "stems": ["drums", "bass", "other", "vocals"],
+      "quality": { "tier": "highest", "sdr_db": 6.8, "notes": "Fine-tuned 4-source ensemble; best vocal isolation of the Demucs family." },
+      "arch": "hybrid-transformer", "arch_cost": 1.15, "arch_future_gain": 1.8,
+      "requirements": { "min_vram_gb": 3, "recommended_vram_gb": 6, "cpu_realtime": false, "fp16": true }
+    },
+    {
+      "id": "bs-roformer",
+      "kind": "stems",
+      "name": "BS-RoFormer (vocals)",
+      "vendor": "ByteDance / community weights",
+      "file": "bs_roformer.onnx",
+      "bundled": false,
+      "hf_repo": "search:bs-roformer onnx",
+      "size_mb": 300,
+      "params_m": 72,
+      "stems": ["vocals", "other"],
+      "quality": { "tier": "sota", "sdr_db": 9.2, "notes": "Band-split RoFormer — current SDR leader for vocal separation. Community ONNX exports vary; verify IO shape before use." },
+      "arch": "roformer-attention", "arch_cost": 1.6, "arch_future_gain": 2.6,
+      "requirements": { "min_vram_gb": 4, "recommended_vram_gb": 8, "cpu_realtime": false, "fp16": true }
+    },
+    {
+      "id": "melband-roformer",
+      "kind": "stems",
+      "name": "Mel-Band RoFormer",
+      "vendor": "community",
+      "file": "melband_roformer.onnx",
+      "bundled": false,
+      "hf_repo": "search:mel-band-roformer",
+      "size_mb": 240,
+      "params_m": 60,
+      "stems": ["vocals", "other"],
+      "quality": { "tier": "sota", "sdr_db": 9.0, "notes": "Mel-scale band split variant; close to BS-RoFormer at lower cost." },
+      "arch": "roformer-attention", "arch_cost": 1.45, "arch_future_gain": 2.6,
+      "requirements": { "min_vram_gb": 4, "recommended_vram_gb": 6, "cpu_realtime": false, "fp16": true }
+    },
+    {
+      "id": "mdx-net-vocals",
+      "kind": "stems",
+      "name": "MDX-Net (vocals)",
+      "vendor": "KUIELab",
+      "file": "mdx_net_vocals.onnx",
+      "bundled": false,
+      "hf_repo": "search:mdx-net onnx vocals",
+      "size_mb": 55,
+      "params_m": 14,
+      "stems": ["vocals", "other"],
+      "quality": { "tier": "medium", "sdr_db": 7.2, "notes": "Lightweight spectrogram U-Net; runs near-realtime on CPU. Good low-VRAM fallback." },
+      "arch": "unet-spectrogram", "arch_cost": 0.55, "arch_future_gain": 1.4,
+      "requirements": { "min_vram_gb": 1, "recommended_vram_gb": 2, "cpu_realtime": true, "fp16": true }
+    },
+
+    {
+      "id": "depth-anything-v2-small",
+      "kind": "depth",
+      "name": "Depth Anything V2 Small",
+      "vendor": "TikTok/ByteDance",
+      "file": "depth_anything_v2_small.onnx",
+      "bundled": true,
+      "hf_repo": "depth-anything/Depth-Anything-V2-Small",
+      "size_mb": 27,
+      "params_m": 24.8,
+      "quality": { "tier": "high", "notes": "uint8-quantized ViT-S; excellent relative depth for album-art parallax at trivial cost." },
+      "arch": "vit-s", "arch_cost": 0.8, "arch_future_gain": 1.5,
+      "requirements": { "min_vram_gb": 0, "recommended_vram_gb": 1, "cpu_realtime": true, "fp16": true },
+      "io": { "input": "518x518 RGB CHW ImageNet-norm", "output": "relative inverse depth" }
+    },
+    {
+      "id": "depth-anything-v2-base",
+      "kind": "depth",
+      "name": "Depth Anything V2 Base",
+      "vendor": "TikTok/ByteDance",
+      "file": "depth_anything_v2_base.onnx",
+      "bundled": false,
+      "hf_repo": "depth-anything/Depth-Anything-V2-Base",
+      "size_mb": 390,
+      "params_m": 97.5,
+      "quality": { "tier": "higher", "notes": "ViT-B backbone; finer subject boundaries on busy covers." },
+      "arch": "vit-b", "arch_cost": 1.0, "arch_future_gain": 1.5,
+      "requirements": { "min_vram_gb": 1, "recommended_vram_gb": 2, "cpu_realtime": false, "fp16": true }
+    },
+    {
+      "id": "depth-anything-v2-large",
+      "kind": "depth",
+      "name": "Depth Anything V2 Large",
+      "vendor": "TikTok/ByteDance",
+      "file": "depth_anything_v2_large.onnx",
+      "bundled": false,
+      "hf_repo": "depth-anything/Depth-Anything-V2-Large",
+      "size_mb": 1340,
+      "params_m": 335,
+      "quality": { "tier": "sota", "notes": "ViT-L; auto-preferred when downloaded and VRAM allows (matches the Android app's behavior)." },
+      "arch": "vit-l", "arch_cost": 1.2, "arch_future_gain": 1.6,
+      "requirements": { "min_vram_gb": 3, "recommended_vram_gb": 6, "cpu_realtime": false, "fp16": true }
+    },
+    {
+      "id": "midas-3-1-swin2-tiny",
+      "kind": "depth",
+      "name": "MiDaS 3.1 Swin2-Tiny",
+      "vendor": "Intel ISL",
+      "file": "midas_swin2_tiny.onnx",
+      "bundled": false,
+      "hf_repo": "Intel/dpt-swinv2-tiny-256",
+      "size_mb": 110,
+      "params_m": 42,
+      "quality": { "tier": "medium", "notes": "Robust classic; smoother gradients, softer edges than DA-V2." },
+      "arch": "swin-t", "arch_cost": 0.9, "arch_future_gain": 1.4,
+      "requirements": { "min_vram_gb": 1, "recommended_vram_gb": 2, "cpu_realtime": true, "fp16": true }
+    }
+  ]
+}

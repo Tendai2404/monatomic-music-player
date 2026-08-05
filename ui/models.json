@@ -1,0 +1,305 @@
+{
+ "registry_version": 3,
+ "note": "Curated model registry for Monatomic. Every non-bundled entry with downloadable != false has an hf_repo + file verified to return HTTP 200 on https://huggingface.co/<hf_repo>/resolve/main/<file> (checked 2026-07). The `file` may be a repo-relative sub-path (e.g. \"onnx/model.onnx\"); the C downloader fetches that URL and saves the file locally under its basename in %APPDATA%/Monatomic/ai-models/. The app also merges live Hugging Face listings (hf_search below) so new community models appear automatically — those are browse-only and never show a Download button. perf model: est_rt_factor = hw_tflops_effective / (params_m * arch_cost). arch_cost reflects architecture efficiency; arch_future_gain projects speedup from known upcoming optimizations (flash-attention style kernels, int8/int4 quant, sparsity) not yet applied to the shipped file.",
+ "hf_search": {
+  "stems": [
+   {
+    "query": "demucs onnx",
+    "pipeline": "audio-to-audio"
+   },
+   {
+    "query": "music source separation onnx",
+    "pipeline": null
+   },
+   {
+    "query": "bs-roformer",
+    "pipeline": null
+   },
+   {
+    "query": "mel-band-roformer",
+    "pipeline": null
+   }
+  ],
+  "depth": [
+   {
+    "query": "depth-anything onnx",
+    "pipeline": "depth-estimation"
+   },
+   {
+    "query": "midas onnx",
+    "pipeline": "depth-estimation"
+   },
+   {
+    "query": "depth estimation onnx",
+    "pipeline": "depth-estimation"
+   }
+  ]
+ },
+ "models": [
+  {
+   "id": "htdemucs-6s",
+   "kind": "stems",
+   "name": "HTDemucs 6-stem",
+   "vendor": "Meta AI",
+   "file": "htdemucs_6s.onnx",
+   "bundled": true,
+   "hf_repo": "StemSplitio/htdemucs-6s-onnx",
+   "size_mb": 246,
+   "params_m": 42,
+   "stems": [
+    "drums",
+    "bass",
+    "other",
+    "vocals",
+    "guitar",
+    "piano"
+   ],
+   "quality": {
+    "tier": "high",
+    "sdr_db": 6.3,
+    "notes": "Hybrid transformer; the 6-source variant trades ~0.3 dB vs 4s FT for guitar+piano stems. Ships with the app; the HF repo mirrors the same file for reinstall."
+   },
+   "arch": "hybrid-transformer",
+   "arch_cost": 1.0,
+   "arch_future_gain": 1.8,
+   "requirements": {
+    "min_vram_gb": 2,
+    "recommended_vram_gb": 4,
+    "cpu_realtime": false,
+    "fp16": true
+   },
+   "io": {
+    "input": "mix f32 [1,2,343980] @44.1kHz",
+    "output": "[1,6,2,343980]"
+   }
+  },
+  {
+   "id": "htdemucs-ft-4s",
+   "kind": "stems",
+   "name": "HTDemucs FT 4-stem",
+   "vendor": "Meta AI",
+   "file": "htdemucs_ft.onnx",
+   "bundled": false,
+   "downloadable": true,
+   "hf_repo": "smank/htdemucs-onnx",
+   "size_mb": 773,
+   "params_m": 84,
+   "stems": [
+    "drums",
+    "bass",
+    "other",
+    "vocals"
+   ],
+   "quality": {
+    "tier": "highest",
+    "sdr_db": 6.8,
+    "notes": "Fine-tuned 4-source ensemble; best vocal isolation of the Demucs family. Single self-contained ONNX (no external .data)."
+   },
+   "arch": "hybrid-transformer",
+   "arch_cost": 1.15,
+   "arch_future_gain": 1.8,
+   "requirements": {
+    "min_vram_gb": 3,
+    "recommended_vram_gb": 6,
+    "cpu_realtime": false,
+    "fp16": true
+   }
+  },
+  {
+   "id": "bs-roformer",
+   "kind": "stems",
+   "name": "BS-RoFormer (vocals)",
+   "vendor": "ByteDance / community weights",
+   "file": "bs_roformer_fp16.onnx",
+   "bundled": false,
+   "downloadable": true,
+   "hf_repo": "safescribeai/bs-roformer-onnx-fp16",
+   "size_mb": 310,
+   "params_m": 72,
+   "stems": [
+    "vocals",
+    "other"
+   ],
+   "quality": {
+    "tier": "sota",
+    "sdr_db": 9.2,
+    "notes": "Band-split RoFormer — current SDR leader for vocal separation. This is the self-contained fp16 export; verify IO shape before use."
+   },
+   "arch": "roformer-attention",
+   "arch_cost": 1.6,
+   "arch_future_gain": 2.6,
+   "requirements": {
+    "min_vram_gb": 4,
+    "recommended_vram_gb": 8,
+    "cpu_realtime": false,
+    "fp16": true
+   }
+  },
+  {
+   "id": "melband-roformer",
+   "kind": "stems",
+   "name": "Mel-Band RoFormer",
+   "vendor": "community",
+   "file": "melband_roformer_vocals.onnx",
+   "bundled": false,
+   "downloadable": true,
+   "hf_repo": "smank/mel-band-roformer-vocals-onnx",
+   "size_mb": 909,
+   "params_m": 60,
+   "stems": [
+    "vocals",
+    "other"
+   ],
+   "quality": {
+    "tier": "sota",
+    "sdr_db": 9.0,
+    "notes": "Mel-scale band split variant; close to BS-RoFormer at lower cost. Single self-contained ONNX."
+   },
+   "arch": "roformer-attention",
+   "arch_cost": 1.45,
+   "arch_future_gain": 2.6,
+   "requirements": {
+    "min_vram_gb": 4,
+    "recommended_vram_gb": 6,
+    "cpu_realtime": false,
+    "fp16": true
+   }
+  },
+  {
+   "id": "mdx-net-vocals",
+   "kind": "stems",
+   "name": "MDX-Net (vocals)",
+   "vendor": "KUIELab / UVR",
+   "file": "UVR-MDX-NET-Voc_FT.onnx",
+   "bundled": false,
+   "downloadable": true,
+   "hf_repo": "ModernMube/HTDemucs_onnx",
+   "size_mb": 64,
+   "params_m": 14,
+   "stems": [
+    "vocals",
+    "other"
+   ],
+   "quality": {
+    "tier": "medium",
+    "sdr_db": 7.2,
+    "notes": "Lightweight spectrogram U-Net (UVR MDX-NET Voc FT). Runs near-realtime on CPU. Good low-VRAM fallback."
+   },
+   "arch": "unet-spectrogram",
+   "arch_cost": 0.55,
+   "arch_future_gain": 1.4,
+   "requirements": {
+    "min_vram_gb": 1,
+    "recommended_vram_gb": 2,
+    "cpu_realtime": true,
+    "fp16": true
+   }
+  },
+  {
+   "id": "depth-anything-v2-small",
+   "kind": "depth",
+   "name": "Depth Anything V2 Small",
+   "vendor": "TikTok/ByteDance",
+   "file": "onnx/model.onnx",
+   "bundled": true,
+   "hf_repo": "onnx-community/depth-anything-v2-small",
+   "size_mb": 94,
+   "params_m": 24.8,
+   "quality": {
+    "tier": "high",
+    "notes": "ViT-S; excellent relative depth for album-art parallax at trivial cost. Ships with the app; the HF repo hosts the fp32 export (onnx/model.onnx) plus fp16/int8 variants."
+   },
+   "arch": "vit-s",
+   "arch_cost": 0.8,
+   "arch_future_gain": 1.5,
+   "requirements": {
+    "min_vram_gb": 0,
+    "recommended_vram_gb": 1,
+    "cpu_realtime": true,
+    "fp16": true
+   },
+   "io": {
+    "input": "518x518 RGB CHW ImageNet-norm",
+    "output": "relative inverse depth"
+   },
+   "save_as": "depth_anything_v2_small.onnx"
+  },
+  {
+   "id": "depth-anything-v2-base",
+   "kind": "depth",
+   "name": "Depth Anything V2 Base",
+   "vendor": "TikTok/ByteDance",
+   "file": "onnx/model.onnx",
+   "bundled": false,
+   "downloadable": true,
+   "hf_repo": "onnx-community/depth-anything-v2-base",
+   "size_mb": 371,
+   "params_m": 97.5,
+   "quality": {
+    "tier": "higher",
+    "notes": "ViT-B backbone; finer subject boundaries on busy covers. Downloads the fp32 onnx/model.onnx (saved locally as model.onnx)."
+   },
+   "arch": "vit-b",
+   "arch_cost": 1.0,
+   "arch_future_gain": 1.5,
+   "requirements": {
+    "min_vram_gb": 1,
+    "recommended_vram_gb": 2,
+    "cpu_realtime": false,
+    "fp16": true
+   },
+   "save_as": "depth_anything_v2_base.onnx"
+  },
+  {
+   "id": "depth-anything-v2-large",
+   "kind": "depth",
+   "name": "Depth Anything V2 Large",
+   "vendor": "TikTok/ByteDance",
+   "file": "onnx/model.onnx",
+   "bundled": false,
+   "downloadable": true,
+   "hf_repo": "onnx-community/depth-anything-v2-large",
+   "size_mb": 1275,
+   "params_m": 335,
+   "quality": {
+    "tier": "sota",
+    "notes": "ViT-L; auto-preferred when downloaded and VRAM allows (matches the Android app's behavior). Downloads the fp32 onnx/model.onnx."
+   },
+   "arch": "vit-l",
+   "arch_cost": 1.2,
+   "arch_future_gain": 1.6,
+   "requirements": {
+    "min_vram_gb": 3,
+    "recommended_vram_gb": 6,
+    "cpu_realtime": false,
+    "fp16": true
+   },
+   "save_as": "depth_anything_v2_large.onnx"
+  },
+  {
+   "id": "midas-3-1-small",
+   "kind": "depth",
+   "name": "MiDaS v2.1 Small",
+   "vendor": "Intel ISL",
+   "file": "midas_v21_small_256.onnx",
+   "bundled": false,
+   "downloadable": true,
+   "hf_repo": "Heliosoph/midas-small-onnx",
+   "size_mb": 63,
+   "params_m": 21,
+   "quality": {
+    "tier": "medium",
+    "notes": "Robust classic MiDaS small (256px); smoother gradients, softer edges than DA-V2. Self-contained ONNX at repo root."
+   },
+   "arch": "efficientnet-lite",
+   "arch_cost": 0.9,
+   "arch_future_gain": 1.4,
+   "requirements": {
+    "min_vram_gb": 1,
+    "recommended_vram_gb": 2,
+    "cpu_realtime": true,
+    "fp16": true
+   }
+  }
+ ]
+}

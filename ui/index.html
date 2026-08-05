@@ -1,0 +1,1105 @@
+<!doctype html>
+<html lang="en" data-theme="black" data-accent="duo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Monatomic</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- resizable panel drag handles -->
+  <div id="resizer-side" class="resizer" title="Drag to resize"></div>
+  <div id="resizer-np" class="resizer" title="Drag to resize"></div>
+  <div id="resizer-player" class="resizer-row" title="Drag to resize"></div>
+
+  <!-- ============ LEFT SIDEBAR ============ -->
+  <aside id="sidebar">
+    <div class="brand">
+      <div class="brand-mark">
+        <svg viewBox="0 0 32 32" width="26" height="26" aria-hidden="true">
+          <circle cx="16" cy="16" r="14" fill="none" stroke="url(#g)" stroke-width="2.5"/>
+          <circle cx="16" cy="16" r="3.4" fill="var(--accent)"/>
+          <path d="M16 4.5 A11.5 11.5 0 0 1 26.2 11" fill="none" stroke="var(--accent-2)" stroke-width="2.5" stroke-linecap="round"/>
+          <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="var(--accent)"/><stop offset="1" stop-color="var(--accent-2)"/>
+          </linearGradient></defs>
+        </svg>
+      </div>
+      <div class="brand-text">
+        <span class="brand-name">Monatomic</span>
+        <span class="brand-sub">Audio Player</span>
+      </div>
+    </div>
+
+    <nav id="nav">
+      <div class="nav-group">
+        <div class="nav-label">Library</div>
+        <button class="nav-item" data-view="0"><span class="nav-ico">▤</span>Tracks</button>
+        <button class="nav-item" data-view="1"><span class="nav-ico">▦</span>Albums</button>
+        <button class="nav-item" data-view="2"><span class="nav-ico">◍</span>Artists</button>
+        <button class="nav-item" data-view="3"><span class="nav-ico">❋</span>Genres</button>
+        <button class="nav-item" data-view="years"><span class="nav-ico">◴</span>Years</button>
+        <button class="nav-item" data-view="4"><span class="nav-ico">▷</span>Folders</button>
+        <button class="nav-item" data-view="stats"><span class="nav-ico">∑</span>Statistics</button>
+      </div>
+      <div class="nav-group">
+        <div class="nav-label">Audiobooks</div>
+        <button class="nav-item" data-view="audiobooks"><span class="nav-ico">◈</span>Audiobooks</button>
+      </div>
+      <!-- custom folder designations (ost, podcast, …) — filled by on("kinds") -->
+      <div class="nav-group" id="nav-custom-kinds" hidden>
+        <div class="nav-label">Libraries</div>
+        <div id="nav-kind-items"></div>
+      </div>
+      <div class="nav-group">
+        <div class="nav-label">Tools</div>
+        <button class="nav-item" data-view="mediatool"><span class="nav-ico">⛭</span>Media Manager</button>
+      </div>
+      <div class="nav-group">
+        <div class="nav-label">Smart</div>
+        <button class="nav-item" data-view="cat:liked"><span class="nav-ico">♥</span>Liked</button>
+        <button class="nav-item" data-view="cat:added"><span class="nav-ico">✚</span>Recently Added</button>
+        <button class="nav-item" data-view="cat:played"><span class="nav-ico">★</span>Most Played</button>
+        <button class="nav-item" data-view="cat:recent"><span class="nav-ico">◷</span>Recently Played</button>
+      </div>
+      <div class="nav-group">
+        <div class="nav-label">Playlists</div>
+        <button class="nav-item" data-view="5"><span class="nav-ico">≡</span>All Playlists</button>
+      </div>
+      <div class="nav-group">
+        <div class="nav-label">Intelligence</div>
+        <button class="nav-item" data-view="models"><span class="nav-ico">✦</span>AI Models</button>
+        <button class="nav-item" data-view="lyrics"><span class="nav-ico">♬</span>Lyrics</button>
+      </div>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="folder-actions">
+        <button id="btn-addfolder" class="btn btn-accent"><span>＋</span> Add folder</button>
+        <button id="btn-rescan" class="btn btn-ghost" title="Rescan library">↻</button>
+      </div>
+
+      <div id="scan-card" class="scan-card" hidden>
+        <div class="scan-head">
+          <span class="scan-spinner"></span>
+          <span class="scan-title">Scanning…</span>
+          <span id="scan-count" class="scan-count">0 / 0</span>
+        </div>
+        <div class="scan-track"><div id="scan-bar" class="scan-fill"></div></div>
+        <div id="scan-source" class="scan-source">—</div>
+        <div class="scan-stats">
+          <span>dirs <b id="scan-dirs">0</b></span>
+          <span>skipped <b id="scan-skipped">0</b></span>
+          <span>errors <b id="scan-errors">0</b></span>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ============ MAIN ============ -->
+  <main id="main">
+    <header id="topbar">
+      <div class="nav-hist" role="group" aria-label="History">
+        <button id="nav-back" class="nav-hist-btn" title="Back (Alt+←, mouse button 4)" disabled>‹</button>
+        <button id="nav-fwd" class="nav-hist-btn" title="Forward (Alt+→, mouse button 5)" disabled>›</button>
+        <button id="nav-refresh" class="nav-hist-btn" title="Refresh this view">⟳</button>
+      </div>
+      <div class="search-wrap">
+        <span class="search-ico">⌕</span>
+        <input id="search" type="search" placeholder="Search tracks, artists, albums…" autocomplete="off" spellcheck="false">
+      </div>
+      <h1 id="view-title">Tracks</h1>
+      <div class="topbar-right">
+        <div class="support-cluster" role="group" aria-label="Support Monatomic">
+          <button id="tb-btc" class="btn btn-ghost tb-support tb-btc" title="Donate Bitcoin — shows QR + address">₿</button>
+          <button id="tb-paypal" class="btn btn-ghost tb-support tb-paypal" title="Donate with PayPal">💳</button>
+          <button id="tb-issue" class="btn btn-ghost tb-support" title="Report an issue">🐞</button>
+        </div>
+        <div class="viewmode-seg" role="group" aria-label="Content view mode">
+          <button id="vm-list" class="vm-btn" title="List — every track (Windows-Media-Player style)">☰</button>
+          <button id="vm-grid" class="vm-btn" title="Album grid">▦</button>
+          <button id="vm-coverflow" class="vm-btn" title="Cover Flow — 3D album carousel">🎴</button>
+          <button id="vm-details" class="vm-btn" title="Albums with inline track lists">🗇</button>
+          <input id="dt-size" type="range" min="90" max="300" step="10" value="150"
+                 title="Album size (details view)" hidden>
+        </div>
+        <label class="sort-wrap">
+          <span class="sort-label">Sort</span>
+          <select id="sort">
+            <option value="title">Title</option>
+            <option value="artist">Artist</option>
+            <option value="album">Album</option>
+            <option value="genre">Genre</option>
+            <option value="year">Year</option>
+            <option value="duration">Duration</option>
+            <option value="rating">Rating</option>
+            <option value="plays">Play count</option>
+            <option value="added">Date added</option>
+            <option value="created" title="The file's real creation date — a bulk import shares one Date added, but each file keeps its own creation date">Date created</option>
+          </select>
+          <button id="sort-dir" class="sort-dir" title="Sort direction" aria-label="Toggle sort direction">↓</button>
+        </label>
+        <label id="tile-size-wrap" class="tile-size-wrap" title="Tile size — also Ctrl+scroll over the grid">
+          <span class="ts-ico">▦</span>
+          <input type="range" id="tile-size" min="120" max="320" step="2" value="178"
+                 aria-label="Album tile size">
+        </label>
+        <button id="btn-settings" class="btn btn-ghost" title="Settings">⚙</button>
+        <button id="btn-uilock" class="btn btn-ghost" title="UI lock">🔒</button>
+        <button id="btn-toggle-np" class="btn btn-ghost" title="Toggle Now Playing panel">◨</button>
+      </div>
+    </header>
+
+    <section id="view">
+      <!-- TRACKS -->
+      <div id="view-tracks" class="view-panel">
+        <div class="hidden-banner" hidden>
+          <span class="hb-txt">Folders hidden — showing partial library</span>
+          <button class="hb-showall btn-mini">Show all</button>
+        </div>
+        <div id="cat-header" class="cat-header" hidden>
+          <span class="cat-chip"><span class="cat-name">Liked songs</span></span>
+          <span class="cat-note"></span>
+          <button class="cat-clear" title="Back to all tracks">✕</button>
+        </div>
+        <div class="table-head">
+          <div class="th col-num sortable" data-sort="track">#</div>
+          <div class="th col-title sortable" data-sort="title">Title</div>
+          <div class="th col-artist sortable" data-sort="artist">Artist</div>
+          <div class="th col-album sortable" data-sort="album">Album</div>
+          <div class="th col-year sortable" data-sort="year">Year</div>
+          <div class="th col-genre sortable" data-sort="genre">Genre</div>
+          <div class="th col-dur sortable" data-sort="duration">Time</div>
+          <div class="th col-rating sortable" data-sort="rating">Rating</div>
+        </div>
+        <div id="track-scroll" class="track-scroll">
+          <div id="track-rows"></div>
+          <div id="track-sentinel" class="sentinel"></div>
+        </div>
+      </div>
+
+      <!-- ALBUMS -->
+      <div id="view-albums" class="view-panel" hidden>
+        <div class="hidden-banner" hidden>
+          <span class="hb-txt">Folders hidden — showing partial library</span>
+          <button class="hb-showall btn-mini">Show all</button>
+        </div>
+        <div id="album-grid" class="album-grid">
+          <!-- sentinel must live INSIDE the scroller (.album-grid) or the
+               IntersectionObserver (root: #album-grid) never fires -->
+          <div id="album-sentinel" class="sentinel"></div>
+        </div>
+      </div>
+
+      <!-- UNIFIED SEARCH RESULTS (tracks + albums + artists sections) -->
+      <div id="view-search" class="view-panel" hidden>
+        <div id="search-scroll" class="search-scroll">
+          <div id="search-summary" class="search-summary"></div>
+          <!-- ALBUMS lead: the art cards are the most recognisable result;
+               artists are a capped single strip so they can never wall the
+               albums/tracks below the fold. -->
+          <div class="search-section" id="search-sec-albums" hidden>
+            <div class="search-sec-title">Albums</div>
+            <div id="search-albums" class="search-albums"></div>
+          </div>
+          <div class="search-section" id="search-sec-artists" hidden>
+            <div class="search-sec-title">Artists</div>
+            <div id="search-artists" class="search-artists"></div>
+          </div>
+          <div class="search-section" id="search-sec-tracks" hidden>
+            <div class="search-sec-title">Tracks
+              <button id="search-alltracks" class="btn-mini">Show all in Tracks view</button>
+            </div>
+            <div id="search-tracks" class="search-tracks"></div>
+          </div>
+          <div id="search-empty" class="search-empty" hidden>No matches.</div>
+        </div>
+      </div>
+
+      <!-- FOLDERS (library sources; hide checkboxes filter the whole library) -->
+      <div id="view-folders" class="view-panel" hidden>
+        <div class="folders-scroll">
+          <div class="folders-intro">
+            Uncheck a folder to hide its content from the whole library —
+            handy for batch-working a prep folder without touching the rest.
+          </div>
+          <div id="folders-list" class="folders-list"></div>
+        </div>
+      </div>
+
+      <!-- AI MODELS (curated registry + Hugging Face sync; rendered by models.js) -->
+      <div id="view-models" class="view-panel" hidden>
+        <div id="models-scroll" class="models-scroll"></div>
+      </div>
+
+      <!-- LYRICS AGGREGATOR (rendered by lyrics.js) -->
+      <div id="view-lyrics" class="view-panel" hidden>
+        <div id="lyrics-root" class="lyrics-root"></div>
+      </div>
+
+      <!-- MEDIA MANAGER (separate power-tool module; rendered by mediatool.js) -->
+      <div id="view-mediatool" class="view-panel" hidden></div>
+
+      <!-- LIBRARY STATISTICS (special-cased view like models/lyrics) -->
+      <div id="view-stats" class="view-panel" hidden>
+        <div id="stats-root" class="stats-scroll"></div>
+      </div>
+
+      <!-- ARTISTS / GENRES / YEARS browse (facet grid + drill-in track list) -->
+      <div id="view-facet" class="view-panel" hidden>
+        <div id="facet-back" class="facet-back" hidden>&larr; Back</div>
+        <div id="facet-grid" class="facet-grid"></div>
+        <div id="facet-tracks" class="facet-tracks" hidden></div>
+      </div>
+
+      <!-- PLAYLISTS (grid of playlist cards + drill-in member list) -->
+      <div id="view-playlists" class="view-panel" hidden>
+        <div id="pl-back" class="facet-back" hidden>&larr; Playlists</div>
+        <div id="pl-grid" class="facet-grid"></div>
+        <div id="pl-tracks" class="facet-tracks" hidden></div>
+      </div>
+
+      <!-- PLACEHOLDER views -->
+      <div id="view-generic" class="view-panel" hidden>
+        <div class="empty-state">
+          <div class="empty-glyph">♪</div>
+          <div id="generic-title" class="empty-title">Coming soon</div>
+          <div class="empty-sub">This view is not populated yet.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ STEM DOCK (always visible, vertical faders) ============ -->
+    <div id="stem-dock">
+      <div class="stem-head">
+        <div class="stem-head-left">
+          <span class="stem-mark" aria-hidden="true"></span>
+          <h2>Stem Mixer</h2>
+          <span id="stem-status" class="stem-status">idle</span>
+        </div>
+        <div class="stem-head-right">
+          <div class="stem-master" id="stem-master" title="Master stem level — scales all nine channels. Double-click to reset.">
+            <span class="stem-master-lab">Master</span>
+            <div class="stem-master-track" id="stem-master-track" role="slider" tabindex="0"
+                 aria-label="Master stem level" aria-orientation="horizontal"
+                 aria-valuemin="0" aria-valuemax="100" aria-valuenow="100">
+              <div class="stem-master-fill" id="stem-master-fill"></div>
+              <div class="stem-master-rail" id="stem-master-rail"><div class="stem-master-knob" id="stem-master-knob"></div></div>
+            </div>
+            <span class="stem-master-val" id="stem-master-val">100</span>
+          </div>
+          <label class="switch"><input type="checkbox" id="stem-enable"><span class="track"></span><span class="switch-label">AI Stems</span></label>
+          <label class="switch"><input type="checkbox" id="stem-passthrough"><span class="track"></span><span class="switch-label">Passthrough</span></label>
+          <button id="stem-collapse" class="btn btn-ghost" title="Collapse stem dock" aria-label="Collapse stem dock" aria-expanded="true">▾</button>
+        </div>
+      </div>
+      <div id="stem-body" class="stem-body">
+        <div id="stem-faders" class="stem-faders"></div>
+        <div id="stem-overlay" class="stem-overlay" hidden>
+          <div id="stem-ov-spin" class="stem-ov-spin" hidden></div>
+          <div id="stem-ov-title" class="stem-ov-title"></div>
+          <div id="stem-ov-sub" class="stem-ov-sub"></div>
+          <button id="stem-ov-btn" class="stem-ov-btn" hidden>Enable AI Stems</button>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- ============ NOW PLAYING PANEL ============ -->
+  <aside id="nowplaying">
+    <div class="np-art-wrap" id="np-art-stage">
+      <button id="np-art-max" class="np-art-max" title="Fullscreen cover (Esc to exit)">⛶</button>
+      <button id="np-art-3dtoggle" class="np-art-max np-art-3dbtn" title="3D album art on/off">◧</button>
+      <div class="np-art-3d" id="np-art-3d">
+        <div id="np-art" class="np-art art-ph"><span class="art-glyph">♪</span></div>
+        <canvas id="np-depth-canvas" class="np-depth-canvas" hidden></canvas>
+        <div class="np-art-glare" id="np-art-glare"></div>
+      </div>
+    </div>
+    <div class="np-meta">
+      <div id="np-title" class="np-title">Nothing playing</div>
+      <div id="np-artist" class="np-artist">—</div>
+      <div id="np-album" class="np-album">—</div>
+      <canvas id="np-spectrum" class="np-spectrum" width="480" height="64"></canvas>
+    </div>
+    <div class="np-queue-head">Up Next</div>
+    <div id="np-queue" class="np-queue"></div>
+  </aside>
+
+  <!-- ============ PLAYER BAR ============ -->
+  <footer id="player">
+    <div class="pl-left">
+      <div id="pl-art" class="pl-art art-ph"><span class="art-glyph">♪</span></div>
+      <div class="pl-meta">
+        <div id="pl-title" class="pl-title">Nothing playing</div>
+        <div id="pl-artist" class="pl-artist">—</div>
+        <div id="pl-format" class="pl-format"></div>
+      </div>
+    </div>
+
+    <div class="pl-center">
+      <div class="transport">
+        <button id="btn-shuffle" class="tbtn" title="Shuffle">⇄</button>
+        <button id="btn-prev" class="tbtn" title="Previous">⏮</button>
+        <button id="btn-back30" class="tbtn tbtn-skip" title="Back 30 s  (Shift: 5 min)">↺30</button>
+        <button id="btn-stop" class="tbtn" title="Stop">■</button>
+        <button id="btn-play" class="tbtn tbtn-play" title="Play / Pause"><span id="play-glyph">▶</span></button>
+        <button id="btn-fwd30" class="tbtn tbtn-skip" title="Forward 30 s  (Shift: 5 min)">30↻</button>
+        <button id="btn-next" class="tbtn" title="Next">⏭</button>
+        <button id="btn-repeat" class="tbtn" title="Repeat">⟳</button>
+        <button id="btn-ab" class="tbtn tbtn-ab" title="A-B repeat — set point A">A·B</button>
+        <button id="btn-eq" class="tbtn" title="Equalizer &amp; effects">🎚</button>
+        <button id="btn-sleep" class="tbtn" title="Sleep timer">🌙</button>
+        <button id="btn-speed" class="tbtn tbtn-speed" title="Playback speed (pitch-preserved)">1×</button>
+        <button id="btn-bookmark" class="tbtn" title="Bookmark this position">🔖</button>
+        <button id="btn-stemexport" class="tbtn" title="Export stems of this track">⑂</button>
+        <span class="tsep"></span>
+        <button id="btn-like" class="tbtn thumb up" title="Like">👍</button>
+        <button id="btn-dislike" class="tbtn thumb down" title="Dislike">👎</button>
+      </div>
+      <div class="seek">
+        <span id="t-elapsed" class="t-time">0:00</span>
+        <div id="seek-track" class="seek-track">
+          <canvas id="wave-canvas" class="wave-canvas"></canvas>
+          <div id="seek-knob" class="seek-knob"></div>
+        </div>
+        <span id="t-total" class="t-time">0:00</span>
+      </div>
+      <div id="pl-details" class="pl-details"></div>
+    </div>
+
+    <div class="pl-right">
+      <div id="depth-pill" class="depth-pill" hidden></div>
+      <div class="pl-right-top">
+        <div class="vol" id="vol-root">
+          <button id="btn-mute" class="tbtn vol-btn" title="Mute (click) · volume (scroll)" style="width:28px;height:28px">
+            <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+              <path class="vb-body" d="M4 9v6h4l5 4V5L8 9H4z" fill="currentColor"/>
+              <path class="vb-w1" d="M16 9.5a3.5 3.5 0 0 1 0 5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+              <path class="vb-w2" d="M18.2 7a7 7 0 0 1 0 10" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+              <line class="vb-x" x1="4" y1="4" x2="21" y2="21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            </svg>
+          </button>
+          <div id="vol-track" class="vol-track">
+            <div id="vol-fill" class="vol-fill"></div>
+            <div id="vol-knob" class="vol-knob"></div>
+          </div>
+          <span id="vol-val" class="vol-val">100</span>
+          <div id="vol-pop" class="vol-pop" popover="manual">
+            <span id="vol-pop-val" class="vol-pop-val">100</span>
+            <div id="vol-pop-track" class="vol-pop-track">
+              <div id="vol-pop-fill" class="vol-pop-fill"></div>
+              <div id="vol-pop-knob" class="vol-pop-knob"></div>
+            </div>
+          </div>
+        </div>
+        <button id="sync-pill" class="sync-pill" hidden title="Library sync">SYNC</button>
+        <button id="btn-art3d" class="btn btn-ghost" title="3D album art on/off — turn off on low-power machines to stop the volumetric renderer entirely">◧</button>
+        <button id="btn-stems" class="btn btn-stems">Stems</button>
+      </div>
+      <div id="pl-out" class="pl-out" title="Exact output: what your audio device is actually running"></div>
+    </div>
+    <!-- general-purpose background-activity status: art scans, folder scans,
+         stem separation, sync, etc. Hidden when the app is idle. -->
+    <div id="pl-status" class="pl-status" hidden>
+      <span class="pl-status-spin" aria-hidden="true"></span>
+      <span id="pl-status-text" class="pl-status-text"></span>
+      <div class="pl-status-bar"><div id="pl-status-fill" class="pl-status-fill"></div></div>
+    </div>
+  </footer>
+
+  <!-- ============ SETTINGS MODAL (tabbed) ============ -->
+  <div id="settings-overlay" class="modal-overlay" hidden>
+    <div class="modal modal-settings">
+      <div class="modal-head">
+        <h2>Settings</h2>
+        <button id="settings-close" class="btn btn-ghost" title="Close settings (Esc)" aria-label="Close settings">✕</button>
+      </div>
+      <div class="settings-body">
+
+        <nav id="settings-tabs" class="settings-tabs" aria-label="Settings sections">
+          <button class="stab" data-tab="playback"><span class="stab-ico">▶</span>Playback</button>
+          <button class="stab" data-tab="library"><span class="stab-ico">▤</span>Library</button>
+          <button class="stab" data-tab="interface"><span class="stab-ico">◧</span>Interface</button>
+          <button class="stab" data-tab="animations"><span class="stab-ico">≈</span>Animations</button>
+          <button class="stab" data-tab="ai"><span class="stab-ico">✦</span>AI Models</button>
+          <button class="stab" data-tab="storage"><span class="stab-ico">▦</span>Storage</button>
+          <button class="stab" data-tab="sync"><span class="stab-ico">⇅</span>Sync</button>
+          <button class="stab" data-tab="about"><span class="stab-ico">◍</span>About</button>
+        </nav>
+
+        <div id="settings-panels" class="settings-panels">
+
+          <!-- ================= PLAYBACK ================= -->
+          <div class="set-tab" data-tab="playback">
+            <div class="set-section">
+              <div class="set-label">Audio</div>
+              <div class="set-row">
+                <span class="set-name">Crossfade</span>
+                <div class="set-ctl">
+                  <input type="range" id="set-crossfade" min="0" max="8000" step="250" value="0">
+                  <span id="set-crossfade-val" class="set-val">off</span>
+                </div>
+              </div>
+              <div class="set-row">
+                <span class="set-name">ReplayGain</span>
+                <label class="switch"><input type="checkbox" id="set-replaygain"><span class="track"></span></label>
+              </div>
+              <div class="set-row">
+                <span class="set-name">ReplayGain mode</span>
+                <select id="set-rgmode" class="eq-preset">
+                  <option value="0">Off</option>
+                  <option value="1">Track</option>
+                  <option value="2">Album</option>
+                </select>
+              </div>
+              <div class="set-row">
+                <span class="set-name">ReplayGain preamp</span>
+                <input type="range" id="set-rgpreamp" min="-12" max="12" step="0.5" value="0">
+                <span id="set-rgpreamp-val" class="set-val">0 dB</span>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Exclusive output (WASAPI)</span>
+                <label class="switch"><input type="checkbox" id="set-exclusive"><span class="track"></span></label>
+              </div>
+              <div class="set-row">
+                <span class="set-name" title="In exclusive mode, open the DAC at the source's native bit depth (16/24) instead of float — true bit-perfect output">Bit-perfect (native bit depth)</span>
+                <label class="switch"><input type="checkbox" id="set-hifibits" checked><span class="track"></span></label>
+              </div>
+              <div class="set-row">
+                <span class="set-name" title="Audiobooks don't benefit from hi-res; cap their output to save power and battery. Music always plays at maximum quality.">Audiobook power cap</span>
+                <select id="set-abcap" class="set-select">
+                  <option value="0">Off (max quality)</option>
+                  <option value="48000-16" selected>48 kHz · 16-bit</option>
+                  <option value="44100-16">44.1 kHz · 16-bit</option>
+                  <option value="24000-16">24 kHz · 16-bit (max saving)</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="set-section">
+              <div class="set-label">Behavior</div>
+              <div class="set-row">
+                <span class="set-name">Gapless playback</span>
+                <span class="set-val" title="Track-to-track playback is always gapless; add Crossfade above for overlapped transitions">Always on</span>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Stem auto-engage margin</span>
+                <span class="set-val" id="set-stemmargin">—</span>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Volume wheel step</span>
+                <select id="set-volstep" class="set-select">
+                  <option value="1">1%</option>
+                  <option value="2">2%</option>
+                  <option value="5">5%</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="set-section">
+              <div class="set-label">Audio Output</div>
+              <div class="set-row">
+                <span class="set-name">Output device</span>
+                <select id="set-device" class="set-select">
+                  <option value="-1">System default</option>
+                </select>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Active device</span>
+                <span class="set-val ac-val" id="ac-device">—</span>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Max bit depth</span>
+                <span class="set-val" id="ac-bits">—</span>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Max sample rate</span>
+                <span class="set-val" id="ac-maxrate">—</span>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Channels</span>
+                <span class="set-val" id="ac-channels">—</span>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Exclusive capable</span>
+                <span class="set-val" id="ac-exclusive">—</span>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Native rates</span>
+                <div class="chip-row" id="ac-rates"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- ================= LIBRARY ================= -->
+          <div class="set-tab" data-tab="library" hidden>
+            <div class="set-section">
+              <div class="set-label">Scan folders</div>
+              <div class="set-hint">Only the folders you added are listed — subfolders found during
+                scans belong to their root. <b>Hide</b> keeps a folder's files indexed but invisible
+                everywhere; <b>Remove</b> deletes its tracks from the library (files on disk are
+                never touched).</div>
+              <div id="roots-list" class="roots-list"><div class="set-hint">Loading…</div></div>
+              <div class="set-row">
+                <span class="set-name">Add a folder</span>
+                <button id="lib-addroot" class="btn btn-accent">＋ Add folder</button>
+              </div>
+            </div>
+
+            <div class="set-section">
+              <div class="set-label">Browsing</div>
+              <div class="set-row">
+                <span class="set-name">Album art size</span>
+                <div class="set-ctl">
+                  <input type="range" id="set-artsize" min="128" max="512" step="64" value="256">
+                  <span id="set-artsize-val" class="set-val">256 px</span>
+                </div>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Show NEW badge for</span>
+                <select id="set-newdays" class="set-select">
+                  <option value="3">3 days</option>
+                  <option value="7">7 days</option>
+                  <option value="14">14 days</option>
+                  <option value="30">30 days</option>
+                </select>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Online art resolution</span>
+                <select id="set-artfetchres" class="set-select" title="Cover size requested when fetching album art online (right-click an album → Find better art online)">
+                  <option value="600">600 × 600</option>
+                  <option value="1200" selected>1200 × 1200</option>
+                  <option value="2000">2000 × 2000</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="set-section">
+              <div class="set-label">Tagging</div>
+              <div class="set-row">
+                <span class="set-name">Fill missing tags from file &amp; folder names</span>
+                <label class="switch" title="When a file has no Title/Artist/Album tag, derive them from the filename (&quot;Artist - Title&quot;, track-number prefixes) and folder name — like MediaMonkey and Poweramp"><input type="checkbox" id="set-infertags" checked><span class="track"></span></label>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Fix untagged tracks now</span>
+                <div class="set-ctl">
+                  <span id="reinfer-result" class="set-val"></span>
+                  <button id="set-reinfer" class="btn btn-ghost" title="Apply name-based tag inference to every already-scanned track with missing Title/Artist/Album — files on disk are never modified">Fill in now</button>
+                </div>
+              </div>
+              <div class="set-hint">Inference never overwrites a real tag and never writes to
+                your files — it only fills the library's own view of untagged tracks.</div>
+            </div>
+
+            <div class="set-section">
+              <div class="set-label">Maintenance tools</div>
+              <div class="set-row">
+                <span class="set-name">Watch folders for changes</span>
+                <label class="switch" title="Monitor every library folder live and rescan automatically a few seconds after files are added, removed or retagged — like MediaMonkey's folder monitoring"><input type="checkbox" id="set-watchfolders" checked><span class="track"></span></label>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Rescan library folders</span>
+                <button id="lib-rescan" class="btn btn-ghost" title="Incremental rescan of every library folder — unchanged files are skipped in microseconds">Rescan now</button>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Import playlists</span>
+                <button id="lib-importpl" class="btn btn-ghost" title="Import .m3u / .m3u8 / .pls playlists found inside the library folders (already-imported names are skipped)">Import playlists</button>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Refresh album art</span>
+                <div class="set-ctl">
+                  <span id="artscan-result" class="set-val"></span>
+                  <button id="set-refreshart" class="btn btn-ghost" title="Regenerate missing album covers from embedded art and folder images">Refresh all covers</button>
+                </div>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Regenerate depth maps</span>
+                <div class="set-ctl">
+                  <button id="set-cleardepth" class="btn btn-ghost" title="Delete every generated 3D depth map; they regenerate on demand (or in the background when batch mapping is on)">Clear &amp; regenerate all</button>
+                </div>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Remove missing tracks</span>
+                <div class="set-ctl">
+                  <span id="purge-result" class="set-val"></span>
+                  <button id="set-purgemissing" class="btn btn-ghost" title="Drop every track whose file no longer exists on disk from the library index">Remove missing tracks</button>
+                </div>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Back up database</span>
+                <button id="lib-backup" class="btn btn-ghost" title="Run a database backup right now">Back up now</button>
+              </div>
+              <div class="set-hint">Backups rotate automatically: the three most recent copies
+                (library.backup1–3.db) live beside the library database.</div>
+            </div>
+
+            <div class="set-section">
+              <div class="set-label">Danger zone</div>
+              <div class="set-row">
+                <span class="set-name">Reset library</span>
+                <button id="set-resetlib" class="btn btn-danger">Reset library…</button>
+              </div>
+              <div id="reset-confirm" class="reset-confirm" hidden>
+                <div class="rc-text">This wipes the entire library index — tracks, playlists and folders — then rescans your library folders from scratch. Your audio files are not touched.</div>
+                <label class="rc-art"><input type="checkbox" id="reset-art"> Also clear the album art cache</label>
+                <div class="rc-btns">
+                  <button id="reset-go" class="btn btn-danger">Reset now</button>
+                  <button id="reset-cancel" class="btn btn-ghost">Cancel</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- ================= INTERFACE ================= -->
+          <div class="set-tab" data-tab="interface" hidden>
+            <div class="set-section">
+              <div class="set-label">Theme</div>
+              <div class="set-row">
+                <span class="set-name">Background</span>
+                <div class="chip-row" id="theme-bg">
+                  <button class="chip" data-bg="black">Black</button>
+                  <button class="chip" data-bg="midnight">Midnight</button>
+                  <button class="chip" data-bg="charcoal">Charcoal</button>
+                </div>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Accent</span>
+                <div class="chip-row" id="theme-accent">
+                  <button class="chip" data-accent="duo"><i class="dot" style="background:linear-gradient(135deg,#FB8C00,#00E5FF)"></i>Orange + Cyan</button>
+                  <button class="chip" data-accent="orange"><i class="dot" style="background:#FB8C00"></i>Orange</button>
+                  <button class="chip" data-accent="cyan"><i class="dot" style="background:#00E5FF"></i>Cyan</button>
+                  <button class="chip" data-accent="violet"><i class="dot" style="background:#8B5CF6"></i>Violet</button>
+                  <button class="chip" data-accent="green"><i class="dot" style="background:#1DB954"></i>Green</button>
+                  <button class="chip" data-accent="custom" id="chip-custom"><i class="dot" id="custom-dot" style="background:#FB8C00"></i>Custom</button>
+                  <input type="color" id="accent-custom" class="accent-input" value="#FB8C00" title="Pick a custom accent color">
+                </div>
+              </div>
+            </div>
+
+            <div class="set-section">
+              <div class="set-label">Visualization</div>
+              <div class="set-row">
+                <span class="set-name">3D depth album art</span>
+                <label class="switch"><input type="checkbox" id="set-art3d" checked><span class="track"></span></label>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Art motion</span>
+                <div class="chip-row" id="art-motion">
+                  <button class="chip" data-motion="pointer">Pointer</button>
+                  <button class="chip" data-motion="showcase">Showcase</button>
+                  <button class="chip" data-motion="off">Off</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="set-section">
+              <div class="set-label">Behavior</div>
+              <div class="set-row">
+                <span class="set-name">UI scale</span>
+                <div class="set-ctl">
+                  <input type="range" id="set-uiscale" min="85" max="125" step="5" value="100">
+                  <span id="set-uiscale-val" class="set-val">100%</span>
+                </div>
+              </div>
+              <div class="set-row">
+                <span class="set-name">GPU-accelerated interface</span>
+                <label class="switch" title="Promote the canvases to compositor layers"><input type="checkbox" id="set-gpuui"><span class="track"></span></label>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Auto-collapse stem dock when idle</span>
+                <label class="switch"><input type="checkbox" id="set-dockidle"><span class="track"></span></label>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Startup view</span>
+                <select id="set-startview" class="set-select" title="Which library view opens when the app starts">
+                  <option value="last">Last used</option>
+                  <option value="0">Tracks</option>
+                  <option value="1">Albums</option>
+                </select>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Action toasts</span>
+                <label class="switch" title="Bottom-center confirmations for actions (sync results, cache clears, …)"><input type="checkbox" id="set-toasts" checked><span class="track"></span></label>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Rescan library on startup</span>
+                <label class="switch" title="Run an incremental rescan of every folder a few seconds after launch (unchanged files skip in microseconds)"><input type="checkbox" id="set-autorescan"><span class="track"></span></label>
+              </div>
+            </div>
+
+            <div class="set-section">
+              <div class="set-label">Layout &amp; type</div>
+              <div class="set-row">
+                <span class="set-name">Sidebar width</span>
+                <div class="set-ctl">
+                  <input type="range" id="cz-sidew" min="170" max="360" step="10" value="230">
+                  <span id="cz-sidew-val" class="set-val">230 px</span>
+                </div>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Reset customizations</span>
+                <button id="cz-resetall" class="btn btn-ghost" title="Restore every zone, element, row-height and width override to defaults">Reset all</button>
+              </div>
+              <div class="set-row">
+                <span class="set-name">List row height</span>
+                <div class="set-ctl">
+                  <input type="range" id="cz-rowh" min="34" max="72" step="2" value="46">
+                  <span id="cz-rowh-val" class="set-val">46 px</span>
+                </div>
+              </div>
+              <div id="cz-zones"></div>
+              <div class="set-row">
+                <span class="set-name">Element</span>
+                <select id="cz-el" class="set-select"></select>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Scale</span>
+                <div class="set-ctl">
+                  <input type="range" id="cz-scale" min="70" max="140" step="5" value="100">
+                  <span id="cz-scale-val" class="set-val">1.00×</span>
+                </div>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Font size</span>
+                <div class="set-ctl">
+                  <input type="range" id="cz-font" min="80" max="130" step="5" value="100">
+                  <span id="cz-font-val" class="set-val">1.00×</span>
+                </div>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Nudge X / Y</span>
+                <div class="set-ctl">
+                  <input type="range" id="cz-x" min="-40" max="40" step="2" value="0" style="width:90px">
+                  <input type="range" id="cz-y" min="-40" max="40" step="2" value="0" style="width:90px">
+                  <button id="cz-reset" class="btn btn-ghost" title="Reset this element">Reset</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- ================= ANIMATIONS ================= -->
+          <div class="set-tab" data-tab="animations" hidden>
+            <div class="set-section">
+              <div class="set-label">Performance</div>
+              <div class="set-row">
+                <span class="set-name">Low power mode</span>
+                <label class="switch" title="For weak GPUs and 2-4 core machines: flat 2D album art, no animations or visualizer, slower background polling, capped AI threads, de-tuned compositor. Compositor and AI-thread changes apply on next launch."><input type="checkbox" id="set-lowpower"><span class="track"></span></label>
+              </div>
+              <div class="set-hint">Turns off the volumetric art renderer, animations, the spectrum
+                visualizer and cover pre-warming, stretches background polling, and (from the next
+                launch) de-tunes the GPU compositor and caps AI model threads.</div>
+            </div>
+            <div class="set-section">
+              <div class="set-label">Motion</div>
+              <div class="set-row">
+                <span class="set-name">UI animations</span>
+                <label class="switch"><input type="checkbox" id="set-anim" checked><span class="track"></span></label>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Album browsing</span>
+                <select id="mo-album" class="set-select" title="How the album library scrolls">
+                  <option value="grid">Grid (vertical)</option>
+                  <option value="details">Details (albums + track lists)</option>
+                  <option value="carousel">Carousel (horizontal)</option>
+                  <option value="rolodex">Rolodex (3D tilt)</option>
+                  <option value="coverflow">Cover Flow (3D carousel)</option>
+                </select>
+              </div>
+              <!-- Every motion channel below is AUTO-GENERATED from the
+                   registry in core/motion.js — one granular control per
+                   element/behaviour, grouped, with hints. -->
+              <div id="mo-granular"></div>
+            </div>
+          </div>
+
+          <!-- ================= AI MODELS ================= -->
+          <div class="set-tab" data-tab="ai" hidden>
+            <div class="set-section">
+              <div class="set-label">Neural models</div>
+              <div class="set-hint">Model downloads, selection and hardware acceleration live in
+                the <b>AI Models</b> view (sidebar → Intelligence).</div>
+              <div class="set-row">
+                <span class="set-name">Model manager</span>
+                <button id="ai-openmodels" class="btn btn-ghost">Open AI Models view</button>
+              </div>
+            </div>
+            <div class="set-section">
+              <div class="set-label">3D depth mapping</div>
+              <div class="set-row">
+                <span class="set-name">Batch 3D depth mapping</span>
+                <label class="switch" title="ON: pre-generate depth maps for every album in the background. OFF (default): only the album you are playing (and albums you explicitly regenerate) get mapped"><input type="checkbox" id="set-depthbatch"><span class="track"></span></label>
+              </div>
+              <div class="set-hint">Depth maps power the volumetric 3D album art. Clearing and
+                regenerating them lives under <b>Library → Maintenance tools</b>.</div>
+            </div>
+          </div>
+
+          <!-- ================= STORAGE ================= -->
+          <div class="set-tab" data-tab="storage" hidden>
+            <div class="set-section">
+              <div class="set-label">Caches on disk</div>
+              <div id="cache-list" class="cache-list"><div class="set-val">Loading…</div></div>
+            </div>
+            <div class="set-section">
+              <div class="set-label">Limits</div>
+              <div class="set-row">
+                <span class="set-name">Stems cache limit</span>
+                <div class="set-ctl">
+                  <input type="range" id="cap-stems" min="2" max="32" step="1" value="8">
+                  <span id="cap-stems-val" class="set-val">8 GB</span>
+                </div>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Art cache limit</span>
+                <div class="set-ctl">
+                  <input type="range" id="cap-art" min="256" max="4096" step="256" value="2048">
+                  <span id="cap-art-val" class="set-val">2.0 GB</span>
+                </div>
+              </div>
+              <div class="set-row">
+                <span class="set-name">RAM art cache</span>
+                <div class="set-ctl">
+                  <input type="range" id="cap-ram" min="0" max="2000" step="100" value="500"
+                         title="Covers held decoded in memory for instant scrolling (0 = off)">
+                  <span id="cap-ram-val" class="set-val">500 covers</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- ================= SYNC ================= -->
+          <div class="set-tab" data-tab="sync" hidden>
+            <div class="set-section">
+              <div class="set-label">Phone connection</div>
+              <div class="set-hint">Your phone runs the sync server: open the Android app and go
+                to <b>Settings → Library Sync</b> — it shows the address to enter below. Likes,
+                ratings and play counts merge in both directions over your local network.</div>
+              <div class="set-row">
+                <span class="set-name">Phone address</span>
+                <div class="set-ctl">
+                  <input type="text" id="sync-host" class="set-input" placeholder="192.168.1.23" spellcheck="false" autocomplete="off">
+                  <input type="number" id="sync-port" class="set-input sync-port" value="8797" min="1" max="65535" title="Port (default 8797)">
+                  <button id="sync-save" class="btn btn-ghost">Save</button>
+                </div>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Automatic sync</span>
+                <label class="switch" title="Sync in the background whenever the phone is reachable"><input type="checkbox" id="sync-auto"><span class="track"></span></label>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Auto-sync every</span>
+                <select id="sync-interval" class="set-select" title="How often automatic sync runs when the phone is reachable">
+                  <option value="10">10 minutes</option>
+                  <option value="30">30 minutes</option>
+                  <option value="60">1 hour</option>
+                  <option value="180">3 hours</option>
+                  <option value="360">6 hours</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="set-section">
+              <div class="set-label">What gets synced</div>
+              <div class="set-hint">Disabled data types are neither sent to the phone nor accepted
+                from it — each side keeps its own values for that type.</div>
+              <div class="set-row">
+                <span class="set-name">Likes &amp; dislikes</span>
+                <label class="switch"><input type="checkbox" id="sync-f-likes" checked><span class="track"></span></label>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Star ratings</span>
+                <label class="switch"><input type="checkbox" id="sync-f-ratings" checked><span class="track"></span></label>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Play counts &amp; last played</span>
+                <label class="switch"><input type="checkbox" id="sync-f-plays" checked><span class="track"></span></label>
+              </div>
+            </div>
+            <div class="set-section">
+              <div class="set-label">Status</div>
+              <div class="set-row">
+                <span class="set-name">Sync status</span>
+                <span id="sync-status" class="set-val sync-status">—</span>
+              </div>
+              <div class="set-row">
+                <span class="set-name">Run a sync</span>
+                <button id="sync-now" class="btn btn-ghost">Sync now</button>
+              </div>
+            </div>
+            <div class="set-section">
+              <div class="set-label">Snapshots (offline transfer)</div>
+              <div class="set-hint">No network between the devices? Export a snapshot file here,
+                copy it to the phone and import it there — or the other way around.</div>
+              <div class="set-row">
+                <span class="set-name">Snapshot file</span>
+                <div class="set-ctl">
+                  <button id="sync-export" class="btn btn-ghost">Export snapshot</button>
+                  <button id="sync-import" class="btn btn-ghost">Import snapshot</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- ================= ABOUT ================= -->
+          <div class="set-tab" data-tab="about" hidden>
+            <div class="set-section">
+              <div class="about-hero">
+                <svg viewBox="0 0 32 32" width="44" height="44" aria-hidden="true">
+                  <circle cx="16" cy="16" r="14" fill="none" stroke="url(#g-about)" stroke-width="2.5"/>
+                  <circle cx="16" cy="16" r="3.4" fill="var(--accent)"/>
+                  <path d="M16 4.5 A11.5 11.5 0 0 1 26.2 11" fill="none" stroke="var(--accent-2)" stroke-width="2.5" stroke-linecap="round"/>
+                  <defs><linearGradient id="g-about" x1="0" y1="0" x2="1" y2="1">
+                    <stop offset="0" stop-color="var(--accent)"/><stop offset="1" stop-color="var(--accent-2)"/>
+                  </linearGradient></defs>
+                </svg>
+                <div class="about-name">Monatomic <span>Audio Player</span></div>
+                <div id="about-version" class="about-version">Version —</div>
+              </div>
+            </div>
+            <div class="set-section">
+              <div class="set-label">Support Monatomic</div>
+              <div class="set-hint">If Monatomic is part of your listening life, a donation keeps
+                it independent and developing.</div>
+              <div class="donate-row">
+                <button id="donate-btc" class="btn donate-btn">
+                  <span class="donate-ico">₿</span> Donate Bitcoin
+                </button>
+                <button id="donate-paypal" class="btn donate-btn">
+                  <span class="donate-ico">💳</span> Donate with PayPal
+                </button>
+                <button id="report-issue" class="btn btn-ghost donate-btn">
+                  <span class="donate-ico">🐞</span> Report an issue
+                </button>
+              </div>
+              <div id="btc-panel" class="btc-panel" hidden>
+                <img id="btc-qr" src="btc-qr.png" alt="Bitcoin donation QR code" width="180" height="180">
+                <div class="btc-side">
+                  <div class="btc-cap">Scan with any wallet, or copy the address:</div>
+                  <code id="btc-addr" class="btc-addr">1KWgwdNdSir2jeLTAcJzsbw96BCrWczjHD</code>
+                  <button id="btc-copy" class="btn btn-mini">Copy address</button>
+                </div>
+              </div>
+            </div>
+            <div class="set-section">
+              <div class="set-label">License</div>
+              <div class="set-hint">Monatomic is source-available: free to use, modify and share
+                for noncommercial purposes — not to sell. Bundled components (CEF, SQLite,
+                miniaudio, ONNX Runtime, …) keep their own licenses.</div>
+              <div class="donate-row">
+                <button id="view-license" class="btn btn-ghost">📜 View license</button>
+                <button id="view-thirdparty" class="btn btn-ghost">Third-party notices</button>
+              </div>
+            </div>
+            <div class="set-section">
+              <div class="set-label">UI modules</div>
+              <div id="about-modules" class="about-modules"></div>
+            </div>
+            <div class="set-section">
+              <div class="set-label">Credits</div>
+              <div class="set-hint">Built on the Monatomic C core — miniaudio playback, SQLite
+                library index, ONNX Runtime neural stems and depth mapping, Chromium Embedded
+                Framework interface. Typeface: Manrope.</div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ ADD FOLDER: content-type chooser ============ -->
+  <div id="kind-overlay" class="modal-overlay" hidden>
+    <div class="modal modal-sm">
+      <div class="modal-head">
+        <h2>Add folder</h2>
+        <button id="kind-close" class="btn btn-ghost" title="Cancel" aria-label="Cancel">✕</button>
+      </div>
+      <div class="modal-body">
+        <div id="kind-path" class="kind-path">—</div>
+        <div class="set-label" style="margin-top:10px">What kind of content is this?</div>
+        <div class="kind-grid">
+          <button class="kind-card" data-kind="music"><span class="kind-ico">♫</span>Music</button>
+          <button class="kind-card" data-kind="audiobooks"><span class="kind-ico">🕮</span>Audiobooks</button>
+          <button class="kind-card" data-kind="podcasts"><span class="kind-ico">🎙</span>Podcasts</button>
+          <button class="kind-card" data-kind="other"><span class="kind-ico">◈</span>Other</button>
+        </div>
+        <div class="set-label" style="margin-top:16px">Library folders</div>
+        <div id="kind-libfolders" class="kind-libfolders"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- bridge-missing error banner -->
+  <div id="bridge-error" class="bridge-error" hidden>
+    Backend bridge not connected — the UI cannot reach the audio engine.
+  </div>
+
+</div>
+
+<!-- Fullscreen 3D cover overlay. The now-playing art stage is MOVED here on
+     maximize (so the same mounted WebGL canvas/worker keeps rendering) and
+     moved back on exit. -->
+<div id="np-art-fs" class="np-art-fs" hidden>
+  <div id="np-art-fs-host" class="np-art-fs-host"></div>
+  <div class="np-art-fs-meta">
+    <div id="np-fs-title" class="np-fs-title"></div>
+    <div id="np-fs-artist" class="np-fs-artist"></div>
+  </div>
+  <button id="np-art-fs-close" class="np-art-fs-close" title="Exit fullscreen (Esc)">✕</button>
+</div>
+
+<!-- ============ EQUALIZER / DSP OVERLAY ============ -->
+<div id="eq-overlay" class="eq-overlay" hidden>
+  <div class="eq-panel">
+    <div class="eq-head">
+      <h2>Equalizer &amp; Audio Effects</h2>
+      <button id="eq-close" class="eq-close" title="Close (Esc)">✕</button>
+    </div>
+    <div class="eq-row eq-top">
+      <label class="switch"><input type="checkbox" id="eq-enable"><span class="track"></span><span class="switch-label">Enable DSP</span></label>
+      <label class="switch"><input type="checkbox" id="eq-eqon"><span class="track"></span><span class="switch-label">Equalizer</span></label>
+      <div class="eq-preset-wrap">
+        <span class="eq-lbl">Preset</span>
+        <select id="eq-preset" class="eq-preset"></select>
+      </div>
+    </div>
+    <div id="eq-bands" class="eq-bands"></div>
+    <div class="eq-row eq-extra">
+      <div class="eq-ctl">
+        <span class="eq-lbl">Preamp</span>
+        <input type="range" id="eq-preamp" min="-12" max="12" step="0.5" value="0">
+        <span id="eq-preamp-val" class="eq-val">0 dB</span>
+      </div>
+      <div class="eq-ctl">
+        <span class="eq-lbl">Balance</span>
+        <input type="range" id="eq-balance" min="-100" max="100" step="1" value="0">
+        <span id="eq-balance-val" class="eq-val">C</span>
+      </div>
+      <label class="switch"><input type="checkbox" id="eq-limiter"><span class="track"></span><span class="switch-label">Limiter</span></label>
+      <button id="eq-reset" class="btn btn-ghost" title="Reset all bands to flat">Reset</button>
+    </div>
+  </div>
+</div>
+
+<script src="core/registry.js"></script>
+<script src="core/virtlist.js"></script>
+<script src="core/motion.js"></script>
+<script src="core/custom.js"></script>
+<script src="core/artram.js"></script>
+<script src="depthart.js"></script>
+<script src="rearrange.js"></script>
+<script src="models.js"></script>
+<script src="lyrics.js"></script>
+<script src="mediatool.js"></script>
+<script src="artedit.js"></script>
+<script src="tagedit.js"></script>
+<script src="app.js"></script>
+<script src="sync.js"></script>
+<script src="artwarm.js"></script>
+<script src="uiresize.js"></script>
+<script src="resizers.js"></script>
+</body>
+</html>

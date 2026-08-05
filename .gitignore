@@ -1,0 +1,46 @@
+# ── Build output ────────────────────────────────────────────────
+/dist/
+/build/
+/release/
+*.zip
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.lib
+__pycache__/
+*.pyc
+
+# ── Large vendored SDKs (binary; re-fetch out of band) ──────────
+# The single-header libs (miniaudio.h, sqlite3.c/.h, dr_*.h, nuklear*,
+# stb_*) ARE tracked — only the big binary SDK trees are ignored.
+/vendor/cef/
+/vendor/ort/
+/vendor/webview2/
+
+# ── Session recovery scratch (safe to delete) ───────────────────
+/_broken_backup_*/
+/_revert_test/
+/_cur_c_save/
+
+# ── OS / editor noise ───────────────────────────────────────────
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.swp
+*~
+
+# CUDA runtime DLLs (1.8 GB binary; staged into dist by build.py)
+/vendor/cuda/
+
+# ── Internal working docs + promo production (reference the author's
+#    personal library/setup — local only, never published) ─────────
+CLAUDE.md
+MODULES.md
+PERF_HANDOVER.md
+FEATURE_AUDIT.md
+PROMO_SCRIPT.md
+PROMO_TRACKS.md
+promo_autopilot.py
+PUBLISH.md
