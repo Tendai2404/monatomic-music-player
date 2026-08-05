@@ -1,5 +1,5 @@
 /*
- * sync.c — Monatomic Audio Player
+ * sync.c — Monatomic Music Player
  * ------------------------------------------------------------------
  * Desktop side of the NEX-GEN library-sync protocol (see sync.h; the
  * companion Android app ships SYNC_PROTOCOL.md). Everything here is blocking

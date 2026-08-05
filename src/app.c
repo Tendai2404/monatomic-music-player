@@ -1,5 +1,5 @@
 /*
- * app.c — Monatomic Audio Player
+ * app.c — Monatomic Music Player
  * ------------------------------------------------------------------
  * Implementation of the top-level application controller declared in
  * app.h. This module is the single seam between the UI/bridge layer and

@@ -1,5 +1,5 @@
 /*
- * playlists.h — Static and smart playlists for Monatomic Audio Player.
+ * playlists.h — Static and smart playlists for Monatomic Music Player.
  *
  * Public C API contract for managing playlists persisted in an sqlite3
  * database. Two playlist kinds are supported:

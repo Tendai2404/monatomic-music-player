@@ -1,5 +1,5 @@
 /*
- * dsp.c - Monatomic Audio Player DSP chain implementation.
+ * dsp.c - Monatomic Music Player DSP chain implementation.
  *
  * Implements dsp.h exactly. The processing chain, applied in place to
  * interleaved 32-bit float PCM inside the audio callback, is:

@@ -1,5 +1,5 @@
 /*
- * app.h — Monatomic Audio Player
+ * app.h — Monatomic Music Player
  * ------------------------------------------------------------------
  * Top-level, UI-facing application controller.
  *

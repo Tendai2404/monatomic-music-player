@@ -1,4 +1,4 @@
-; Monatomic Audio Player — Inno Setup installer.
+; Monatomic Music Player — Inno Setup installer.
 ; Build:  ISCC.exe monatomic.iss   (after `python build.py --target win-x64`)
 ; Output: F:\Monatomic\release\MonatomicSetup-<ver>.exe
 ;
@@ -8,10 +8,10 @@
 ; %LOCALAPPDATA%\Monatomic (this installed layout). Library/settings/stems
 ; already live in %APPDATA%\Monatomic and survive uninstall.
 
-#define MyAppName "Monatomic"
+#define MyAppName "Monatomic Music Player"
 #define MyAppVersion "1.0.0"
 #define MyAppExeName "monatomic.exe"
-#define MyRepoURL "https://github.com/Tendai2404/Monatomic"
+#define MyRepoURL "https://github.com/Tendai2404/monatomic-music-player"
 
 [Setup]
 AppId={{8B1F3C57-6E1D-4A52-9C0A-2D5B7E4F1A90}
@@ -22,7 +22,7 @@ AppPublisher=Monatomic
 AppPublisherURL={#MyRepoURL}
 AppSupportURL={#MyRepoURL}/issues
 AppUpdatesURL={#MyRepoURL}/releases
-DefaultDirName={autopf}\{#MyAppName}
+DefaultDirName={autopf}\Monatomic
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 LicenseFile=F:\Monatomic\LICENSE.md

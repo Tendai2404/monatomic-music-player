@@ -1,5 +1,5 @@
 /* ==========================================================================
- * stems.h — Monatomic Audio Player
+ * stems.h — Monatomic Music Player
  *
  * Real-time neural stem separation (HTDemucs, 6 stems) via ONNX Runtime CUDA,
  * band-split into 9 user-facing control channels, plus a resident mixing

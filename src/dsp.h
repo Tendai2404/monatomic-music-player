@@ -1,5 +1,5 @@
 /*
- * dsp.h - Monatomic Audio Player DSP chain public API.
+ * dsp.h - Monatomic Music Player DSP chain public API.
  *
  * Real-time-safe digital signal processing chain intended to run inside the
  * audio callback. The chain processes interleaved 32-bit float PCM in place:

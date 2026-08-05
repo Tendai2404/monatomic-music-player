@@ -1,5 +1,5 @@
 /*
- * playback.h -- Queue/playback controller for Monatomic Audio Player.
+ * playback.h -- Queue/playback controller for Monatomic Music Player.
  *
  * A thin controller layered over the audio engine (mn_engine). It owns the
  * play queue, playback state machine, shuffle/repeat logic, crossfade and

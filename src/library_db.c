@@ -1,5 +1,5 @@
 /*
- * library_db.c - SQLite-backed library index for Monatomic Audio Player.
+ * library_db.c - SQLite-backed library index for Monatomic Music Player.
  *
  * Implementation of library_db.h against the vendored amalgamation
  * vendor/sqlite3.c (SQLite 3.46.1, built with -DSQLITE_ENABLE_FTS5).

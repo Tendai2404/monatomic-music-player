@@ -1,5 +1,5 @@
 /*
- * library_db.h - SQLite-backed library index for Monatomic Audio Player.
+ * library_db.h - SQLite-backed library index for Monatomic Music Player.
  *
  * A clean C API contract for indexing and querying EXTREMELY LARGE music
  * libraries (target: 1,000,000+ tracks). Everything here is designed to avoid

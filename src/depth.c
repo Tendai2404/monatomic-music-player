@@ -1,5 +1,5 @@
 /* ==========================================================================
- * depth.c -- Monatomic Audio Player
+ * depth.c -- Monatomic Music Player
  *
  * Implementation of depth.h: cover-art depth-map generation with
  * Depth-Anything-V2-Small via the ONNX Runtime C API, CPU execution provider.

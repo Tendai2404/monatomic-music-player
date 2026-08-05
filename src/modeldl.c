@@ -1,5 +1,5 @@
 /*
- * modeldl.c — Monatomic Audio Player
+ * modeldl.c — Monatomic Music Player
  *
  * Hugging Face single-file downloader over WinHTTP.
  *

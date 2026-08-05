@@ -1,5 +1,5 @@
 /* ============================================================
-   MONATOMIC — Audio Player UI logic
+   MONATOMIC — Music Player UI logic
    Talks to the C core over the CEF message bridge.
    ============================================================ */
 (function () {
@@ -5318,7 +5318,7 @@
        no history, no dedup). The version + selftest tip ride the template. */
     const v = ($("#about-version") || {}).textContent || "";
     send({ cmd: "openurl",
-           url: "https://github.com/Tendai2404/Monatomic/issues/new?title=" +
+           url: "https://github.com/Tendai2404/monatomic-music-player/issues/new?title=" +
                 encodeURIComponent("[bug] ") +
                 "&body=" + encodeURIComponent(
                   "**Version:** " + v + "\n\n**What happened:**\n\n\n" +

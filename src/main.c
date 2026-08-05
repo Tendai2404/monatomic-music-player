@@ -1,5 +1,5 @@
 /*
- * Monatomic Audio Player — entry point.
+ * Monatomic Music Player — entry point.
  *
  * Creates the application controller (library db, audio, stems, playback) and
  * hands it to the CEF (open Chromium) host, which renders the HTML/CSS/JS UI and

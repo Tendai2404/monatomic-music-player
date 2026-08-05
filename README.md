@@ -1,11 +1,28 @@
-# Monatomic
+# Monatomic Music Player
 
 **A Windows music + audiobook player with a live neural stem mixer.**
 Mute the singer of any song while it plays. Solo the drums. Export the stems.
 Then browse 50,000 tracks with zero lag and pick your book back up mid-sentence.
 
 Native C backend (audio, database, inference) + Chromium UI. No account, no
-cloud, no telemetry. Free.
+cloud, no telemetry. Free. The first release from **Monatomic** — more to come.
+
+[![PayPal](https://img.shields.io/badge/PayPal-donate-00457C?logo=paypal&logoColor=white)](https://www.paypal.com/donate/?business=stinger2404%40gmail.com&currency_code=USD)
+[![Bitcoin](https://img.shields.io/badge/Bitcoin-donate-F7931A?logo=bitcoin&logoColor=white)](#-support-the-project)
+[![License](https://img.shields.io/badge/license-noncommercial-8A2BE2)](LICENSE.md)
+
+> **Monatomic is free and always will be — no ads, no accounts, no upsell.**
+> It's built and maintained by one developer. If it replaces your music
+> player, consider fueling the next release:
+>
+> - **PayPal** → [donate here](https://www.paypal.com/donate/?business=stinger2404%40gmail.com&currency_code=USD)
+> - **Bitcoin** → `1KWgwdNdSir2jeLTAcJzsbw96BCrWczjHD` — scan the QR in-app
+>   (**About → Support**) or copy it with one click there
+
+---
+
+![Live stem mixer over the album wall](docs/screenshots/stems.png)
+*The 9-channel neural stem mixer, live over a 52,000-track library — the blue banner in the waveform is separation running in real time.*
 
 ---
 
@@ -59,14 +76,21 @@ instant.
 - Portable or installed — either way your data stays in `%APPDATA%\Monatomic`
 - No account, no cloud, no analytics. The network is touched only when you ask (model downloads, online art/lyrics search)
 
+## Gallery
+
+| | |
+|---|---|
+| ![Album grid](docs/screenshots/grid.png) *Resizable album wall — art everywhere, cold or warm* | ![Cover Flow](docs/screenshots/coverflow.png) *3D Cover Flow with depth-mapped covers* |
+| ![Audiobooks](docs/screenshots/audiobooks.png) *Continue Listening shelf — resume mid-sentence* | ![Search](docs/screenshots/search.png) *Albums, artists, tracks — as fast as you type* |
+
 ## Install
 
-Grab the latest [release](https://github.com/Tendai2404/Monatomic/releases):
+Grab the latest [release](https://github.com/Tendai2404/monatomic-music-player/releases):
 
 | Package | For |
 |---|---|
 | **MonatomicSetup-x.y.z.exe** | Normal install: Program Files, Start Menu, uninstaller |
-| **Monatomic-x.y.z-win-x64.zip** | Portable: unzip anywhere and run `monatomic.exe` |
+| **Monatomic-x.y.z-win-x64-portable.7z** | Portable: extract anywhere and run `monatomic.exe` (Windows 11 opens .7z natively) |
 
 Windows 10/11 x64. An NVIDIA GPU accelerates stem separation; without one the
 CPU path is used automatically (slower, same results).
@@ -109,8 +133,13 @@ The installer is built with [Inno Setup](https://jrsoftware.org/isinfo.php):
 don't sell it. Third-party components under their own licenses:
 [THIRD-PARTY.md](THIRD-PARTY.md).
 
-## Support the project
+## 💛 Support the project
 
-- **Report issues** → [GitHub Issues](https://github.com/Tendai2404/Monatomic/issues) (or the 🐞 button in the app)
-- **Bitcoin** → `1KWgwdNdSir2jeLTAcJzsbw96BCrWczjHD`
-- **PayPal** → [donate](https://www.paypal.com/donate/?business=stinger2404%40gmail.com&currency_code=USD)
+Monatomic Music Player is free, ad-free, and cloudless — donations are what
+keep it moving. Every bit goes straight into development time.
+
+| | |
+|---|---|
+| **PayPal** | [**Donate →**](https://www.paypal.com/donate/?business=stinger2404%40gmail.com&currency_code=USD) |
+| **Bitcoin** | `1KWgwdNdSir2jeLTAcJzsbw96BCrWczjHD` (QR + one-click copy in-app under **About → Support**) |
+| **Can't donate?** | Star the repo, [report a bug](https://github.com/Tendai2404/monatomic-music-player/issues), or tell one person who still pays for a worse player. |

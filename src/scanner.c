@@ -1,5 +1,5 @@
 /*
- * scanner.c -- Monatomic Audio Player
+ * scanner.c -- Monatomic Music Player
  *
  * Implementation of the multi-threaded, incremental filesystem scanner
  * declared in scanner.h.

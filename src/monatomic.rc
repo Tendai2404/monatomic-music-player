@@ -1,4 +1,4 @@
-// Monatomic Audio Player — Windows resources.
+// Monatomic Music Player — Windows resources.
 // Compiled with rc.exe and linked so the exe carries the app icon
 // (Explorer, taskbar, Alt-Tab) and basic version info.
 
@@ -21,11 +21,11 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "CompanyName", "Monatomic"
-            VALUE "FileDescription", "Monatomic Audio Player"
+            VALUE "FileDescription", "Monatomic Music Player"
             VALUE "FileVersion", "1.0.0.0"
             VALUE "InternalName", "monatomic"
             VALUE "OriginalFilename", "monatomic.exe"
-            VALUE "ProductName", "Monatomic Audio Player"
+            VALUE "ProductName", "Monatomic Music Player"
             VALUE "ProductVersion", "1.0.0.0"
         END
     END

@@ -1,5 +1,5 @@
 /*
- * scanner.h -- Monatomic Audio Player
+ * scanner.h -- Monatomic Music Player
  *
  * Multi-threaded, incremental filesystem scanner.
  *

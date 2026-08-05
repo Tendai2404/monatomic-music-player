@@ -1,5 +1,5 @@
 /*
- * modeldl.h — Monatomic Audio Player
+ * modeldl.h — Monatomic Music Player
  *
  * Hugging Face model downloader. Fetches a single file from a HF repo to a
  * destination directory over HTTPS (WinHTTP), following the resolve/main ->

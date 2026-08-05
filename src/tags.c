@@ -1,5 +1,5 @@
 /*
- * tags.c — Monatomic Audio Player
+ * tags.c — Monatomic Music Player
  *
  * Implementation of the metadata + embedded-cover-art reader declared in
  * tags.h. Dependency-light: relies only on the C standard library. Every

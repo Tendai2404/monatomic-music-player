@@ -1,5 +1,5 @@
 /*
- * sync.h — Monatomic Audio Player
+ * sync.h — Monatomic Music Player
  * ------------------------------------------------------------------
  * Desktop side of the NEX-GEN library-sync protocol (SYNC_PROTOCOL.md v1):
  * per-track likes/dislikes, 5-star ratings, play counts and last-played

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Monatomic Audio Player — portable multi-platform build.
+Monatomic Music Player — portable multi-platform build.
 
 Pick a target and it compiles the C backend + CEF frontend, then stages EVERY
 runtime dependency (CEF Chromium, ONNX Runtime, fonts, UI) beside the exe so the

@@ -1,5 +1,5 @@
 /*
- * tags.h — Monatomic Audio Player
+ * tags.h — Monatomic Music Player
  *
  * Metadata and embedded-cover-art reader.
  *

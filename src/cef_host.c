@@ -8429,7 +8429,7 @@ int webview_run(mn_app *app, const char *ui_dir, const char *art_dir) {
      * the CEF child's rectangle during resize (compounds the erase storm).
      * The child already has WS_CLIPCHILDREN|WS_CLIPSIBLINGS. */
     g_host_hwnd = CreateWindowExW(
-        0, L"MonatomicCefHost", L"Monatomic Audio Player",
+        0, L"MonatomicCefHost", L"Monatomic Music Player",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, 1400, 900,
         NULL, NULL, hinst, NULL);

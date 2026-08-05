@@ -1,5 +1,5 @@
 /*
- * playlists.c — Implementation of playlists.h for Monatomic Audio Player.
+ * playlists.c — Implementation of playlists.h for Monatomic Music Player.
  *
  * Static playlists, smart-playlist rule compilation, JSON persistence of rule
  * trees, and M3U/M3U8/PLS import/export, all against a caller-owned sqlite3*.

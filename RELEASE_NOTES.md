@@ -1,4 +1,4 @@
-# Monatomic Audio Player — v1.0.0
+# Monatomic Music Player — v1.0.0
 
 The first release. A native C audio player with a Chromium UI, built for
 very large libraries (tested against 52,000+ tracks), neural stem

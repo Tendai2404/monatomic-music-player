@@ -1,5 +1,5 @@
 /*
- * tags_write.h — Monatomic Audio Player
+ * tags_write.h — Monatomic Music Player
  *
  * Metadata WRITER: tag fields, embedded cover art and embedded lyrics for
  * the three formats the editor UI supports:

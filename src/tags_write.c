@@ -1,5 +1,5 @@
 /*
- * tags_write.c — Monatomic Audio Player
+ * tags_write.c — Monatomic Music Player
  *
  * Implementation of the metadata writer declared in tags_write.h. Mirrors
  * the reader's (tags.c) hand-rolled container parsing conventions:
