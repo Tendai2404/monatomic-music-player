@@ -10,6 +10,7 @@
    app.js opens this view via MnPodcasts.open(modApi).
    ============================================================ */
 window.MnPodcasts = (function () {
+  let lastPlayMeta = null;   /* right-panel Episode Notes (app.js nowMeta) */
   "use strict";
 
   /* ---------- helpers ---------- */
@@ -615,10 +616,23 @@ window.MnPodcasts = (function () {
       title: ep.title,
       artist: feed.title,
       duration_ms: (ep.durationSec || 0) * 1000,
+      art: (feed.artworkUrl || ""),
     };
     if (ep.localPath) { msg.url = ep.localPath; msg.local = true; }
     else msg.url = ep.audioUrl;
     lastPlay = { url: msg.url, guid: ep.guid, ts: Date.now() };
+    lastPlayMeta = {
+      url: msg.url,
+      description: ep.description || "",
+      date: ep.pubDateMs ? new Date(ep.pubDateMs).toLocaleDateString(
+        undefined, { day: "numeric", month: "short", year: "numeric" }) : "",
+      duration: ep.durationSec
+        ? (ep.durationSec >= 3600
+            ? Math.floor(ep.durationSec / 3600) + "h " +
+              Math.round((ep.durationSec % 3600) / 60) + "m"
+            : Math.max(1, Math.round(ep.durationSec / 60)) + " min")
+        : "",
+    };
     bridge.send(msg);
     updateEpRow(ep.guid);
   }
@@ -1337,7 +1351,9 @@ window.MnPodcasts = (function () {
     requestUsage();
   }
 
-  return { open };
+  return { open,
+    nowMeta: (url) => (lastPlayMeta && lastPlayMeta.url === url) ? lastPlayMeta : lastPlayMeta,
+  };
 })();
 
 /* module registry: expose this file as an independent block */

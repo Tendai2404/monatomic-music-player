@@ -267,6 +267,7 @@ window.MnRadio = (function () {
       title: st.name,
       artist: subtitleOf(st),
       kind: "radio",
+      art: st.favicon || "",
     });
     updateLiveRows();
   }

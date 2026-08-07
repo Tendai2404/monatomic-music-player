@@ -4057,6 +4057,7 @@
        (stem_fraction keyed at 5% steps: the STEMS pill still tracks
        progress without a rebuild per poll.) */
     const nowKey = [
+      m.online, m.online_art, m.online_kind,
       m.track_title, m.track_artist, m.track_album, m.art, m.track_id,
       m.playing, m.shuffle, m.repeat, m.liked,
       m.format, m.sample_rate, m.bit_depth, m.channels, m.bitrate_kbps,
@@ -4080,16 +4081,38 @@
        hashed): while PAUSED the memoized now-payload suppresses re-emits, so
        a thumb that was still extracting at pause time can ONLY reach these
        tiles via a targeted artready repaint. */
-    {
+    if (m.online && m.online_art) {
+      /* Online session: the station favicon / show artwork is a REMOTE url
+         (radio-browser / iTunes / RSS), not an art-cache entry — inject it
+         directly with a glyph fallback for dead links. */
+      const setRemote = (host) => {
+        if (!host || host.dataset.onlineArt === m.online_art) return;
+        host.dataset.onlineArt = m.online_art;
+        host.innerHTML = "";
+        const img = document.createElement("img");
+        img.className = "fade in";
+        img.alt = "";
+        img.onerror = () => { host.innerHTML = '<span class="art-glyph">' +
+          (m.online_kind === "podcast" ? "◍" : "◉") + "</span>"; };
+        img.src = m.online_art;
+        host.appendChild(img);
+      };
+      setRemote(E.plArt);
+      setRemote(E.npArt);
+      if (state._npArtUrl) { state._npArtUrl = ""; updateVolumetricArt(""); }
+    } else {
+      if (E.plArt && E.plArt.dataset.onlineArt) delete E.plArt.dataset.onlineArt;
+      if (E.npArt && E.npArt.dataset.onlineArt) delete E.npArt.dataset.onlineArt;
       const nk = m.track_album ?
         artKeyOf(m.track_album_artist || m.track_artist, m.track_album) : "";
       setArt(E.plArt, m.art, null, nk);
       setArt(E.npArt, m.art, null, nk);
+      if (m.art !== state._npArtUrl) {
+        state._npArtUrl = m.art;
+        updateVolumetricArt(m.art);
+      }
     }
-    if (m.art !== state._npArtUrl) {
-      state._npArtUrl = m.art;
-      updateVolumetricArt(m.art);
-    }
+    renderOnlineCard(m);
 
     E.plFormat.innerHTML = "";
     const kHz = (r) => (r / 1000).toFixed(r % 1000 ? 1 : 0) + " kHz";
@@ -4502,6 +4525,87 @@
   });
   function requestWaveform(id) {
     if (id && id !== waveForId) { waveBars = null; waveForId = id; send({ cmd: "waveform", id }); }
+  }
+
+  /* ---- Online right-panel card ------------------------------------
+     Radio: a live "Recently played" log built from ICY StreamTitle
+     changes — the only universally gettable schedule-equivalent (no
+     radio directory exposes programme schedules). Podcasts: episode
+     notes from the feed via MnPodcasts.nowMeta() when available. */
+  const npOnline = $("#np-online");
+  state._icyLog = [];
+  state._icyUrl = "";
+  function renderOnlineCard(m) {
+    if (!npOnline) return;
+    if (!m.online) {
+      if (!npOnline.hidden) { npOnline.hidden = true; npOnline.innerHTML = ""; }
+      state._icyLog = []; state._icyUrl = "";
+      return;
+    }
+    if (m.online_kind === "radio") {
+      if (m.online_url !== state._icyUrl) {
+        state._icyUrl = m.online_url;
+        state._icyLog = [];
+      }
+      const t = (m.stream_title || "").trim();
+      if (t && (!state._icyLog.length || state._icyLog[0].t !== t)) {
+        state._icyLog.unshift({ t, at: Date.now() });
+        if (state._icyLog.length > 30) state._icyLog.length = 30;
+      }
+      npOnline.hidden = false;
+      npOnline.innerHTML = "";
+      const h = document.createElement("div");
+      h.className = "np-online-head";
+      h.textContent = "On Air · Recently Played";
+      npOnline.appendChild(h);
+      if (!state._icyLog.length) {
+        const d = document.createElement("div");
+        d.className = "np-online-empty";
+        d.textContent = "Waiting for song info from the station…";
+        npOnline.appendChild(d);
+      }
+      state._icyLog.forEach((e, i) => {
+        const row = document.createElement("div");
+        row.className = "np-online-row" + (i === 0 ? " live" : "");
+        const dot = document.createElement("span");
+        dot.className = "np-online-dot";
+        const txt = document.createElement("span");
+        txt.className = "np-online-song";
+        txt.textContent = e.t;
+        const when = document.createElement("span");
+        when.className = "np-online-when";
+        when.textContent = i === 0 ? "now" :
+          Math.max(1, Math.round((Date.now() - e.at) / 60000)) + "m ago";
+        row.appendChild(dot); row.appendChild(txt); row.appendChild(when);
+        npOnline.appendChild(row);
+      });
+      return;
+    }
+    if (m.online_kind === "podcast") {
+      const meta = (window.MnPodcasts && MnPodcasts.nowMeta)
+        ? MnPodcasts.nowMeta(m.online_url) : null;
+      npOnline.hidden = false;
+      if (npOnline.dataset.podUrl === m.online_url) return;
+      npOnline.dataset.podUrl = m.online_url;
+      npOnline.innerHTML = "";
+      const h = document.createElement("div");
+      h.className = "np-online-head";
+      h.textContent = "Episode Notes";
+      npOnline.appendChild(h);
+      const d = document.createElement("div");
+      d.className = "np-online-desc";
+      d.textContent = (meta && meta.description) ? meta.description
+        : "No episode notes in this feed.";
+      npOnline.appendChild(d);
+      if (meta && (meta.date || meta.duration)) {
+        const f = document.createElement("div");
+        f.className = "np-online-facts";
+        f.textContent = [meta.date, meta.duration].filter(Boolean).join(" · ");
+        npOnline.appendChild(f);
+      }
+      return;
+    }
+    npOnline.hidden = true;
   }
 
   E.btnPlay.addEventListener("click", () => send({ cmd: "toggle" }));

@@ -246,6 +246,7 @@ typedef struct mn_now {
     bool    online_live;                /* unseekable live mount (radio)    */
     char    online_kind[12];            /* "radio" | "podcast" | "stream"   */
     char    online_url[MN_STR_PATH];    /* source URL (or local file path)  */
+    char    online_art[MN_STR_PATH];    /* station favicon / show artwork    */
     char    stream_title[MN_STR_SHORT]; /* latest ICY StreamTitle, "" none  */
 } mn_now;
 
@@ -752,7 +753,7 @@ void mn_app_now(mn_app *app, mn_now *out);
  * worker thread only. On failure `err` (optional) has a short reason. */
 bool mn_app_online_play(mn_app *app, const char *src, const char *title,
                         const char *artist, const char *kind,
-                        int64_t duration_ms, bool local,
+                        const char *art_url, int64_t duration_ms, bool local,
                         char *err, size_t err_cap);
 void mn_app_online_stop(mn_app *app);
 bool mn_app_online_active(mn_app *app);

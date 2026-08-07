@@ -1958,6 +1958,7 @@ static void build_now(strbuf *b) {
         sb_puts(b, "\"online_kind\":");  sb_json_str(b, now.online_kind);  sb_putc(b, ',');
         sb_puts(b, "\"online_url\":");   sb_json_str(b, now.online_url);   sb_putc(b, ',');
         sb_puts(b, "\"online_live\":");  sb_json_bool(b, now.online_live); sb_putc(b, ',');
+        sb_puts(b, "\"online_art\":");   sb_json_str(b, now.online_art);   sb_putc(b, ',');
         sb_puts(b, "\"stream_title\":"); sb_json_str(b, now.stream_title); sb_putc(b, ',');
     }
     sb_puts(b, "\"art\":");          sb_json_str(b, art);
@@ -5625,7 +5626,7 @@ static void datafile_path(char *out, size_t n, const char *name) {
 
 typedef struct {
     cef_frame_t *frame;
-    char *url, *title, *artist, *kind;
+    char *url, *title, *artist, *kind, *art;
     int64_t dur_ms;
     int   local;
 } ne_stream_ctx;
@@ -5636,7 +5637,8 @@ static DWORD WINAPI streamplay_thread(LPVOID p) {
     bool ok;
     worker_enter();
     ok = mn_app_online_play(g_app, c->url, c->title, c->artist, c->kind,
-                            c->dur_ms, c->local != 0, err, sizeof(err));
+                            c->art, c->dur_ms, c->local != 0,
+                            err, sizeof(err));
     {
         strbuf b; sb_init(&b);
         sb_puts(&b, "{\"type\":\"streamres\",\"ok\":");
@@ -5651,7 +5653,8 @@ static DWORD WINAPI streamplay_thread(LPVOID p) {
             if (c->frame) c->frame->base.release(&c->frame->base);
         }
     }
-    free(c->url); free(c->title); free(c->artist); free(c->kind); free(c);
+    free(c->url); free(c->title); free(c->artist); free(c->kind);
+    free(c->art); free(c);
     worker_leave();
     return 0;
 }
@@ -5665,6 +5668,7 @@ static void streamplay_start(cef_frame_t *frame_owned, const char *json) {
     c->title  = json_get_str_alloc(json, "title");
     c->artist = json_get_str_alloc(json, "artist");
     c->kind   = json_get_str_alloc(json, "kind");
+    c->art    = json_get_str_alloc(json, "art");
     c->dur_ms = json_get_i64(json, "duration_ms", 0);
     c->local  = json_get_bool(json, "local", false) ? 1 : 0;
     if (!c->url || !c->url[0]) goto fail;
@@ -5673,7 +5677,8 @@ static void streamplay_start(cef_frame_t *frame_owned, const char *json) {
     CloseHandle(th);
     return;
 fail:
-    if (c) { free(c->url); free(c->title); free(c->artist); free(c->kind); free(c); }
+    if (c) { free(c->url); free(c->title); free(c->artist); free(c->kind);
+             free(c->art); free(c); }
     if (frame_owned) {
         post_emit(frame_owned,
             "{\"type\":\"streamres\",\"ok\":false,\"url\":\"\","

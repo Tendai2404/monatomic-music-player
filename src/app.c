@@ -362,6 +362,7 @@ struct mn_app {
         char     title[MN_STR_SHORT];    /* station / episode title        */
         char     artist[MN_STR_SHORT];   /* subtitle / feed title          */
         char     url[MN_STR_PATH];
+        char     art[MN_STR_PATH];       /* favicon / show artwork URL     */
         char     icy[MN_STR_SHORT];      /* latest StreamTitle             */
         uint32_t icy_seq;
     } online;
@@ -4838,7 +4839,7 @@ void mn_app_seek_ms(mn_app *app, int64_t position_ms)
 
 bool mn_app_online_play(mn_app *app, const char *src, const char *title,
                         const char *artist, const char *kind,
-                        int64_t duration_ms, bool local,
+                        const char *art_url, int64_t duration_ms, bool local,
                         char *err, size_t err_cap)
 {
     mn_result r;
@@ -4895,6 +4896,8 @@ bool mn_app_online_play(mn_app *app, const char *src, const char *title,
     mn_copy_str(app->online.artist, sizeof(app->online.artist),
                 artist ? artist : "");
     mn_copy_str(app->online.url,    sizeof(app->online.url),    src);
+    mn_copy_str(app->online.art,    sizeof(app->online.art),
+                art_url ? art_url : "");
     /* If the server sent a station name and the caller had none, use it. */
     if ((!title || !title[0]) && app->engine) {
         const char *sn = mn_engine_stream_station(app->engine);
@@ -5486,6 +5489,8 @@ static void mn_app_now_impl(mn_app *app, mn_now *out, bool want_art)
                     app->online.kind);
         mn_copy_str(out->online_url, sizeof(out->online_url),
                     app->online.url);
+        mn_copy_str(out->online_art, sizeof(out->online_art),
+                    app->online.art);
         out->online_live = mn_engine_is_stream(app->engine) &&
                            !mn_engine_stream_seekable(app->engine);
         out->playing  = (mn_engine_state(app->engine) == MN_STATE_PLAYING);
