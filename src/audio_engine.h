@@ -180,6 +180,28 @@ void mn_engine_destroy(mn_engine *engine);
 mn_result mn_engine_load(mn_engine *engine, const char *path);
 
 /*
+ * Load an HTTP(S) audio stream (internet radio / streamed podcast episode).
+ * Blocks for connect + pre-roll — call from a worker thread, never the CEF
+ * UI thread. `want_icy` requests ICY (Icecast) song-title metadata (radio).
+ * Duration comes from a prior mn_engine_set_length_hint_ms (podcasts) or is
+ * unknown/0 (live). On failure `err` (optional) carries a short reason and
+ * the previous track is unloaded. MP3/FLAC/WAV payloads; AAC/MP4 returns
+ * MN_ERR_UNSUPPORTED until the MF byte-stream bridge lands.
+ */
+mn_result mn_engine_load_url(mn_engine *engine, const char *url, int want_icy,
+                             char *err, size_t err_cap);
+
+/* Stream introspection: is the loaded track an HTTP stream / is it
+ * Range-seekable / latest ICY StreamTitle (seq-diffed, see netstream.h) /
+ * icy-name station header. */
+int  mn_engine_is_stream(mn_engine *engine);
+int  mn_engine_nettest_decode(const char *url);   /* --nettest2 harness */
+int  mn_engine_stream_seekable(mn_engine *engine);
+int  mn_engine_stream_title(mn_engine *engine, char *out, size_t cap,
+                            uint32_t *seq);
+const char *mn_engine_stream_station(mn_engine *engine);
+
+/*
  * Start (or resume) playback of the loaded track. If already playing this is a
  * no-op returning MN_OK. Returns MN_ERR_STATE if no track is loaded.
  */

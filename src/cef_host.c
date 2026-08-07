@@ -68,6 +68,7 @@
 #include "include/cef_api_hash.h"   /* cef_api_hash() — configures the API version */
 
 #include "app.h"
+#include "netstream.h"   /* podcast episode downloads (poddl_thread) */
 #include "audio_engine.h"   /* mn_engine_waveform() for the waveform command */
 #include "dsp.h"            /* MN_DSP_EQ_BANDS, band freq + preset names (EQ) */
 #include "artcache.h"
@@ -523,6 +524,9 @@ static void mn_dir_trim(const char *dir, const char *pattern, int64_t cap_bytes)
 static void mn_dir_pattern_stats(const char *dir, const char *pattern,
                                  int64_t *bytes, int64_t *files);
 static void dispatch_command(cef_frame_t *frame, const char *json);
+static void datafile_path(char *out, size_t n, const char *name);
+/* #define MN_TRACE_DISPATCH 1 — TID_UI hang forensics: last dispatch.log
+ * line names the blocking cmd. Costs a file append per command when on. */
 static void artscan_selfheal_start(void);
 static void art_integrity_kick(int64_t limit);         /* art-integrity subsystem */
 static volatile LONG g_artverify_missing;              /* last sweep: missing count */
@@ -546,6 +550,14 @@ static void book_progress_tick(void);
 static void playlist_export_start(cef_frame_t *frame, int64_t id, const char *name);
 static void stemexport_start(cef_frame_t *frame, const char *json);
 static void post_emit_owned(cef_frame_t *frame_owned, char *json_heap);
+/* Online (internet radio / podcasts) async starters. */
+static void streamplay_start(cef_frame_t *frame_owned, const char *json);
+static void httpfetch_start(cef_frame_t *frame_owned, const char *json);
+static void poddl_start(cef_frame_t *frame_owned, const char *json);
+static void poddl_cancel(const char *json);
+static void podusage_build(strbuf *b);
+static void pod_delete_cmd(const char *json, bool whole_feed);
+static void onlinefile_cmd(cef_frame_t *frame, const char *json, bool save);
 static cef_frame_t *sync_grab_frame(void);   /* owned main-frame ref or NULL */
 static void sync_start(cef_frame_t *frame_owned);
 static void syncfile_start(cef_frame_t *frame_owned, bool import,
@@ -1940,6 +1952,14 @@ static void build_now(strbuf *b) {
         sb_json_float(b, now.stem_meters[i]);
     }
     sb_puts(b, "],");
+    /* Online session (internet radio / streamed podcast). */
+    sb_puts(b, "\"online\":");       sb_json_bool(b, now.online);          sb_putc(b, ',');
+    if (now.online) {
+        sb_puts(b, "\"online_kind\":");  sb_json_str(b, now.online_kind);  sb_putc(b, ',');
+        sb_puts(b, "\"online_url\":");   sb_json_str(b, now.online_url);   sb_putc(b, ',');
+        sb_puts(b, "\"online_live\":");  sb_json_bool(b, now.online_live); sb_putc(b, ',');
+        sb_puts(b, "\"stream_title\":"); sb_json_str(b, now.stream_title); sb_putc(b, ',');
+    }
     sb_puts(b, "\"art\":");          sb_json_str(b, art);
     sb_putc(b, '}');
 }
@@ -2295,6 +2315,20 @@ static void dispatch_command(cef_frame_t *frame, const char *json) {
 
     char cmd[64];
     if (!json_get_str(json, "cmd", cmd, sizeof(cmd))) return;
+
+#ifdef MN_TRACE_DISPATCH
+    /* TID_UI hang forensics: the LAST line names the blocking cmd. */
+    {
+        char tp[1400];
+        FILE *tf;
+        datafile_path(tp, sizeof(tp), "dispatch.log");
+        tf = fopen(tp, "a");
+        if (tf) {
+            fprintf(tf, "%lu %s\n", (unsigned long)GetTickCount(), cmd);
+            fclose(tf);
+        }
+    }
+#endif
 
     if (strcmp(cmd, "searchsug") == 0) {
         /* Live search suggestions: independent prefix-match over tracks; the
@@ -2690,6 +2724,45 @@ static void dispatch_command(cef_frame_t *frame, const char *json) {
         char q[512];
         json_get_str(json, "q", q, sizeof(q));
         mn_app_set_search(g_app, q);
+    } else if (strcmp(cmd, "streamplay") == 0) {
+        /* Internet radio / podcast playback (worker thread; blocking net). */
+        frame->base.add_ref(&frame->base);
+        streamplay_start(frame, json);
+    } else if (strcmp(cmd, "streamstop") == 0) {
+        mn_app_online_stop(g_app);
+    } else if (strcmp(cmd, "httpfetch") == 0) {
+        /* RSS/feed fetch for the UI (arbitrary hosts have no CORS). */
+        frame->base.add_ref(&frame->base);
+        httpfetch_start(frame, json);
+    } else if (strcmp(cmd, "poddownload") == 0) {
+        frame->base.add_ref(&frame->base);
+        poddl_start(frame, json);
+    } else if (strcmp(cmd, "poddlcancel") == 0) {
+        poddl_cancel(json);
+    } else if (strcmp(cmd, "poddelete") == 0) {
+        strbuf b;
+        pod_delete_cmd(json, false);
+        sb_init(&b);
+        podusage_build(&b);
+        if (!b.oom) emit_to_frame(frame, b.data);
+        sb_free(&b);
+    } else if (strcmp(cmd, "podwipe") == 0) {
+        strbuf b;
+        pod_delete_cmd(json, true);
+        sb_init(&b);
+        podusage_build(&b);
+        if (!b.oom) emit_to_frame(frame, b.data);
+        sb_free(&b);
+    } else if (strcmp(cmd, "podusage") == 0) {
+        strbuf b; sb_init(&b);
+        podusage_build(&b);
+        if (!b.oom) emit_to_frame(frame, b.data);
+        sb_free(&b);
+    } else if (strcmp(cmd, "onlineload") == 0) {
+        frame->base.add_ref(&frame->base);
+        onlinefile_cmd(frame, json, false);
+    } else if (strcmp(cmd, "onlinesave") == 0) {
+        onlinefile_cmd(NULL, json, true);
     } else if (strcmp(cmd, "play") == 0) {
         mn_app_play_row(g_app, json_get_i64(json, "id", 0));
     } else if (strcmp(cmd, "playalbum") == 0) {
@@ -5532,6 +5605,589 @@ static void datafile_path(char *out, size_t n, const char *name) {
     }
     snprintf(out, n, "%s\\%s", data_dir, name);
 }
+
+/* ==========================================================================
+ * ONLINE — internet radio + podcasts.
+ *   streamplay/streamstop : engine-direct HTTP (or downloaded-file) playback
+ *   httpfetch             : RSS/OPML fetch for the UI (feeds have no CORS)
+ *   poddownload/-cancel   : episode download into <data>\podcasts\<feed>\
+ *   poddelete/podwipe/podusage : download management
+ *   onlineload/onlinesave : <data>\online_<name>.json persistence (streams,
+ *                           podcast subscriptions) shared across instances
+ * All network work runs on worker threads (dispatch is the CEF UI thread).
+ * ========================================================================== */
+
+#define NE_POD_MAX_DL   8            /* concurrent episode downloads */
+#define NE_HTTP_CAP     (8u * 1024u * 1024u)
+#define NE_ONLINE_CAP   (4u * 1024u * 1024u)
+
+/* ---- streamplay ---------------------------------------------------- */
+
+typedef struct {
+    cef_frame_t *frame;
+    char *url, *title, *artist, *kind;
+    int64_t dur_ms;
+    int   local;
+} ne_stream_ctx;
+
+static DWORD WINAPI streamplay_thread(LPVOID p) {
+    ne_stream_ctx *c = (ne_stream_ctx *)p;
+    char err[256] = {0};
+    bool ok;
+    worker_enter();
+    ok = mn_app_online_play(g_app, c->url, c->title, c->artist, c->kind,
+                            c->dur_ms, c->local != 0, err, sizeof(err));
+    {
+        strbuf b; sb_init(&b);
+        sb_puts(&b, "{\"type\":\"streamres\",\"ok\":");
+        sb_json_bool(&b, ok);
+        sb_puts(&b, ",\"url\":");   sb_json_str(&b, c->url);
+        sb_puts(&b, ",\"error\":"); sb_json_str(&b, err);
+        sb_putc(&b, '}');
+        if (!b.oom) {
+            post_emit_owned(c->frame, b.data);   /* takes both ownerships */
+        } else {
+            sb_free(&b);
+            if (c->frame) c->frame->base.release(&c->frame->base);
+        }
+    }
+    free(c->url); free(c->title); free(c->artist); free(c->kind); free(c);
+    worker_leave();
+    return 0;
+}
+
+static void streamplay_start(cef_frame_t *frame_owned, const char *json) {
+    ne_stream_ctx *c = (ne_stream_ctx *)calloc(1, sizeof(*c));
+    HANDLE th;
+    if (!c) goto fail;
+    c->frame  = frame_owned;
+    c->url    = json_get_str_alloc(json, "url");
+    c->title  = json_get_str_alloc(json, "title");
+    c->artist = json_get_str_alloc(json, "artist");
+    c->kind   = json_get_str_alloc(json, "kind");
+    c->dur_ms = json_get_i64(json, "duration_ms", 0);
+    c->local  = json_get_bool(json, "local", false) ? 1 : 0;
+    if (!c->url || !c->url[0]) goto fail;
+    th = CreateThread(NULL, 0, streamplay_thread, c, 0, NULL);
+    if (!th) goto fail;
+    CloseHandle(th);
+    return;
+fail:
+    if (c) { free(c->url); free(c->title); free(c->artist); free(c->kind); free(c); }
+    if (frame_owned) {
+        post_emit(frame_owned,
+            "{\"type\":\"streamres\",\"ok\":false,\"url\":\"\","
+            "\"error\":\"bad request\"}");
+    }
+}
+
+/* ---- generic HTTPS GET (RSS / directory fallback) ------------------ */
+
+/* Body may be any charset; the JSON bridge requires valid UTF-8. When the
+ * payload isn't UTF-8, re-encode it byte-wise as Latin-1 -> UTF-8 (lossless
+ * for the common ISO-8859-1 feeds; garbage-in stays readable). */
+static bool ne_utf8_valid(const unsigned char *s, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        unsigned char c = s[i];
+        size_t need = (c < 0x80) ? 0 :
+                      (c >> 5) == 0x6 ? 1 :
+                      (c >> 4) == 0xE ? 2 :
+                      (c >> 3) == 0x1E ? 3 : (size_t)-1;
+        if (need == (size_t)-1 || i + need >= n + 1) return false;
+        if (need > 0) {
+            size_t k;
+            if (i + need >= n + 0 && i + need > n - 1) return false;
+            for (k = 1; k <= need; ++k) {
+                if (i + k >= n || (s[i + k] & 0xC0) != 0x80) return false;
+            }
+        }
+        i += need + 1;
+    }
+    return true;
+}
+
+static char *ne_to_utf8(char *body, size_t len, size_t *out_len) {
+    char *out; size_t i, o = 0;
+    if (ne_utf8_valid((unsigned char *)body, len)) { *out_len = len; return body; }
+    out = (char *)malloc(len * 2 + 1);
+    if (!out) { *out_len = len; return body; }
+    for (i = 0; i < len; ++i) {
+        unsigned char c = (unsigned char)body[i];
+        if (c < 0x80) out[o++] = (char)c;
+        else { out[o++] = (char)(0xC0 | (c >> 6)); out[o++] = (char)(0x80 | (c & 0x3F)); }
+    }
+    out[o] = 0;
+    free(body);
+    *out_len = o;
+    return out;
+}
+
+/* Blocking GET with redirects; returns malloc'd NUL-terminated body (caller
+ * frees) or NULL. Worker-thread only. */
+static char *ne_http_get(const char *url, int *status_out, size_t cap,
+                         size_t *len_out) {
+    wchar_t wurl[2048], whost[512], wpath[1536];
+    URL_COMPONENTS uc;
+    HINTERNET ses = NULL, con = NULL, req = NULL;
+    char  *body = NULL;
+    size_t len = 0, buf_cap = 0;
+    DWORD  status = 0, sl = sizeof(status), opt;
+
+    if (status_out) *status_out = 0;
+    if (len_out) *len_out = 0;
+    MultiByteToWideChar(CP_UTF8, 0, url, -1, wurl, 2048);
+    memset(&uc, 0, sizeof(uc));
+    uc.dwStructSize = sizeof(uc);
+    uc.lpszHostName = whost; uc.dwHostNameLength = 512;
+    uc.lpszUrlPath  = wpath; uc.dwUrlPathLength  = 1536;
+    if (!WinHttpCrackUrl(wurl, 0, 0, &uc)) return NULL;
+
+    ses = WinHttpOpen(L"Monatomic/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!ses) goto done;
+    WinHttpSetTimeouts(ses, 15000, 15000, 15000, 20000);
+    con = WinHttpConnect(ses, whost, uc.nPort, 0);
+    if (!con) goto done;
+    req = WinHttpOpenRequest(con, L"GET", wpath, NULL, WINHTTP_NO_REFERER,
+                             WINHTTP_DEFAULT_ACCEPT_TYPES,
+                             uc.nScheme == INTERNET_SCHEME_HTTPS
+                                 ? WINHTTP_FLAG_SECURE : 0);
+    if (!req) goto done;
+    opt = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+    WinHttpSetOption(req, WINHTTP_OPTION_REDIRECT_POLICY, &opt, sizeof(opt));
+    if (!WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(req, NULL)) goto done;
+    WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE |
+                             WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX, &status, &sl,
+                        WINHTTP_NO_HEADER_INDEX);
+    if (status_out) *status_out = (int)status;
+
+    for (;;) {
+        DWORD avail = 0, got = 0;
+        if (!WinHttpQueryDataAvailable(req, &avail) || avail == 0) break;
+        if (len + avail > cap) { free(body); body = NULL; goto done; }
+        if (len + avail + 1 > buf_cap) {
+            size_t ncap = buf_cap ? buf_cap * 2 : 128 * 1024;
+            char  *nb;
+            while (ncap < len + avail + 1) ncap *= 2;
+            nb = (char *)realloc(body, ncap);
+            if (!nb) { free(body); body = NULL; goto done; }
+            body = nb; buf_cap = ncap;
+        }
+        if (!WinHttpReadData(req, body + len, avail, &got) || got == 0) break;
+        len += got;
+    }
+    if (body) body[len] = 0;
+    else { body = (char *)calloc(1, 1); }
+    if (len_out) *len_out = len;
+
+done:
+    if (req) WinHttpCloseHandle(req);
+    if (con) WinHttpCloseHandle(con);
+    if (ses) WinHttpCloseHandle(ses);
+    return body;
+}
+
+typedef struct {
+    cef_frame_t *frame;
+    char *url;
+    char  id[64];
+} ne_httpfetch_ctx;
+
+static DWORD WINAPI httpfetch_thread(LPVOID p) {
+    ne_httpfetch_ctx *c = (ne_httpfetch_ctx *)p;
+    int    status = 0;
+    size_t len = 0;
+    char  *body;
+    worker_enter();
+    body = ne_http_get(c->url, &status, NE_HTTP_CAP, &len);
+    if (body) body = ne_to_utf8(body, len, &len);
+    {
+        strbuf b; sb_init(&b);
+        sb_puts(&b, "{\"type\":\"httpbody\",\"id\":");
+        sb_json_str(&b, c->id);
+        sb_puts(&b, ",\"ok\":");
+        sb_json_bool(&b, body != NULL && status >= 200 && status < 300);
+        sb_puts(&b, ",\"status\":");
+        sb_json_int(&b, status);
+        sb_puts(&b, ",\"body\":");
+        sb_json_str(&b, body ? body : "");
+        sb_putc(&b, '}');
+        if (!b.oom) {
+            post_emit_owned(c->frame, b.data);
+        } else {
+            sb_free(&b);
+            if (c->frame) c->frame->base.release(&c->frame->base);
+        }
+    }
+    free(body);
+    free(c->url); free(c);
+    worker_leave();
+    return 0;
+}
+
+static void httpfetch_start(cef_frame_t *frame_owned, const char *json) {
+    ne_httpfetch_ctx *c = (ne_httpfetch_ctx *)calloc(1, sizeof(*c));
+    HANDLE th;
+    if (!c) goto fail;
+    c->frame = frame_owned;
+    c->url   = json_get_str_alloc(json, "url");
+    json_get_str(json, "id", c->id, sizeof(c->id));
+    if (!c->url || (_strnicmp(c->url, "http://", 7) != 0 &&
+                    _strnicmp(c->url, "https://", 8) != 0)) goto fail;
+    th = CreateThread(NULL, 0, httpfetch_thread, c, 0, NULL);
+    if (!th) goto fail;
+    CloseHandle(th);
+    return;
+fail:
+    if (c) { free(c->url); free(c); }
+    if (frame_owned) frame_owned->base.release(&frame_owned->base);
+}
+
+/* ---- podcast episode downloads ------------------------------------- */
+
+static void pod_dir_path(char *out, size_t n, const char *feed) {
+    char base[1400];
+    datafile_path(base, sizeof(base), "podcasts");
+    CreateDirectoryA(base, NULL);
+    if (feed && feed[0]) snprintf(out, n, "%s\\%s", base, feed);
+    else                 snprintf(out, n, "%s", base);
+}
+
+/* File-name safety: [A-Za-z0-9._ -] only, no traversal, non-empty. */
+static bool pod_name_ok(const char *s) {
+    size_t i, n;
+    if (!s || !s[0]) return false;
+    n = strlen(s);
+    if (n > 160 || strstr(s, "..")) return false;
+    for (i = 0; i < n; ++i) {
+        char c = s[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '_' ||
+              c == '-' || c == ' ')) return false;
+    }
+    return s[0] != '.';
+}
+
+typedef struct {
+    volatile LONG used;
+    volatile LONG cancel;
+    char guid[128];
+} ne_poddl_slot;
+static ne_poddl_slot g_poddl[NE_POD_MAX_DL];
+
+typedef struct {
+    cef_frame_t *frame;
+    char *url;
+    char  feed[32], guid[128], fname[192];
+    int   slot;
+} ne_poddl_ctx;
+
+static DWORD WINAPI poddl_thread(LPVOID p) {
+    ne_poddl_ctx *c = (ne_poddl_ctx *)p;
+    char dir[1400], part[1600], final_p[1600], err[128] = {0};
+    mn_netstream *ns = NULL;
+    FILE *out = NULL;
+    int64_t total = -1, done_bytes = 0, last_emit = 0;
+    bool ok = false, cancelled = false;
+
+    worker_enter();
+    pod_dir_path(dir, sizeof(dir), c->feed);
+    CreateDirectoryA(dir, NULL);
+    snprintf(final_p, sizeof(final_p), "%s\\%s", dir, c->fname);
+    snprintf(part, sizeof(part), "%s.part", final_p);
+
+    ns = mn_netstream_open(c->url, false, err, sizeof(err));
+    if (!ns) goto finish;
+    total = mn_netstream_length(ns);
+    out = fopen(part, "wb");
+    if (!out) { snprintf(err, sizeof(err), "can't write file"); goto finish; }
+
+    {
+        char *buf = (char *)malloc(256 * 1024);
+        if (!buf) { snprintf(err, sizeof(err), "oom"); goto finish; }
+        for (;;) {
+            size_t got;
+            if (InterlockedCompareExchange(&g_poddl[c->slot].cancel, 0, 0)) {
+                cancelled = true; break;
+            }
+            got = mn_netstream_read(ns, buf, 256 * 1024);
+            if (got == 0) break;
+            if (fwrite(buf, 1, got, out) != got) {
+                snprintf(err, sizeof(err), "disk write failed"); break;
+            }
+            done_bytes += (int64_t)got;
+            if (done_bytes - last_emit >= 256 * 1024) {
+                last_emit = done_bytes;
+                cef_frame_t *fr = sync_grab_frame();
+                if (fr) {
+                    char msg[512];
+                    double pct = (total > 0)
+                        ? ((double)done_bytes * 100.0 / (double)total) : 0.0;
+                    if (pct > 99.0) pct = 99.0;
+                    snprintf(msg, sizeof(msg),
+                        "{\"type\":\"poddl\",\"guid\":\"%s\",\"bytes\":%lld,"
+                        "\"total\":%lld,\"pct\":%.1f,\"done\":false}",
+                        c->guid, (long long)done_bytes, (long long)total, pct);
+                    post_emit(fr, msg);
+                }
+            }
+        }
+        free(buf);
+    }
+    if (out) { fclose(out); out = NULL; }
+    if (!cancelled && !err[0] && done_bytes > 0 &&
+        (total <= 0 || done_bytes >= total)) {
+        ok = MoveFileExA(part, final_p, MOVEFILE_REPLACE_EXISTING) != 0;
+        if (!ok) snprintf(err, sizeof(err), "rename failed");
+    } else if (!err[0] && !cancelled) {
+        snprintf(err, sizeof(err), done_bytes == 0 ? "empty response"
+                                                   : "connection lost");
+    }
+
+finish:
+    if (out) fclose(out);
+    if (!ok) DeleteFileA(part);
+    if (ns) mn_netstream_close(ns);
+    {
+        strbuf b; sb_init(&b);
+        sb_puts(&b, "{\"type\":\"poddl\",\"guid\":");
+        sb_json_str(&b, c->guid);
+        sb_puts(&b, ",\"bytes\":"); sb_json_i64(&b, done_bytes);
+        sb_puts(&b, ",\"total\":"); sb_json_i64(&b, total);
+        sb_puts(&b, ",\"pct\":");   sb_json_int(&b, ok ? 100 : 0);
+        sb_puts(&b, ",\"done\":true,\"ok\":");
+        sb_json_bool(&b, ok);
+        sb_puts(&b, ",\"cancelled\":"); sb_json_bool(&b, cancelled);
+        sb_puts(&b, ",\"error\":"); sb_json_str(&b, cancelled ? "" : err);
+        sb_puts(&b, ",\"file\":");  sb_json_str(&b, ok ? final_p : "");
+        sb_putc(&b, '}');
+        if (!b.oom) {
+            post_emit_owned(c->frame, b.data);
+        } else {
+            sb_free(&b);
+            if (c->frame) c->frame->base.release(&c->frame->base);
+        }
+    }
+    InterlockedExchange(&g_poddl[c->slot].used, 0);
+    free(c->url); free(c);
+    worker_leave();
+    return 0;
+}
+
+static void poddl_start(cef_frame_t *frame_owned, const char *json) {
+    ne_poddl_ctx *c = (ne_poddl_ctx *)calloc(1, sizeof(*c));
+    HANDLE th;
+    int    i, slot = -1;
+    if (!c) goto fail;
+    c->frame = frame_owned;
+    c->url   = json_get_str_alloc(json, "url");
+    json_get_str(json, "feed",  c->feed,  sizeof(c->feed));
+    json_get_str(json, "guid",  c->guid,  sizeof(c->guid));
+    json_get_str(json, "fname", c->fname, sizeof(c->fname));
+    if (!c->url || !pod_name_ok(c->feed) || !pod_name_ok(c->fname) ||
+        !c->guid[0]) goto fail;
+    /* single-flight per guid + slot claim */
+    for (i = 0; i < NE_POD_MAX_DL; ++i) {
+        if (InterlockedCompareExchange(&g_poddl[i].used, 0, 0) &&
+            strcmp(g_poddl[i].guid, c->guid) == 0) goto fail;  /* dup */
+    }
+    for (i = 0; i < NE_POD_MAX_DL; ++i) {
+        if (InterlockedCompareExchange(&g_poddl[i].used, 1, 0) == 0) {
+            slot = i; break;
+        }
+    }
+    if (slot < 0) goto fail;   /* all slots busy */
+    InterlockedExchange(&g_poddl[slot].cancel, 0);
+    snprintf(g_poddl[slot].guid, sizeof(g_poddl[slot].guid), "%s", c->guid);
+    c->slot = slot;
+    th = CreateThread(NULL, 0, poddl_thread, c, 0, NULL);
+    if (!th) { InterlockedExchange(&g_poddl[slot].used, 0); goto fail; }
+    CloseHandle(th);
+    return;
+fail:
+    if (c) { free(c->url); free(c); }
+    if (frame_owned) frame_owned->base.release(&frame_owned->base);
+}
+
+static void poddl_cancel(const char *json) {
+    char guid[128];
+    int  i;
+    if (!json_get_str(json, "guid", guid, sizeof(guid)) || !guid[0]) return;
+    for (i = 0; i < NE_POD_MAX_DL; ++i) {
+        if (InterlockedCompareExchange(&g_poddl[i].used, 0, 0) &&
+            strcmp(g_poddl[i].guid, guid) == 0) {
+            InterlockedExchange(&g_poddl[i].cancel, 1);
+        }
+    }
+}
+
+/* Delete one downloaded episode file, or a feed's whole download dir. */
+static void pod_delete_cmd(const char *json, bool whole_feed) {
+    char feed[32], fname[192], dir[1400], path[1600];
+    if (!json_get_str(json, "feed", feed, sizeof(feed)) ||
+        !pod_name_ok(feed)) return;
+    pod_dir_path(dir, sizeof(dir), feed);
+    if (whole_feed) {
+        WIN32_FIND_DATAA fd;
+        char pat[1600];
+        HANDLE h;
+        snprintf(pat, sizeof(pat), "%s\\*", dir);
+        h = FindFirstFileA(pat, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                    snprintf(path, sizeof(path), "%s\\%s", dir, fd.cFileName);
+                    DeleteFileA(path);
+                }
+            } while (FindNextFileA(h, &fd));
+            FindClose(h);
+        }
+        RemoveDirectoryA(dir);
+        return;
+    }
+    if (!json_get_str(json, "fname", fname, sizeof(fname)) ||
+        !pod_name_ok(fname)) return;
+    snprintf(path, sizeof(path), "%s\\%s", dir, fname);
+    DeleteFileA(path);
+}
+
+/* {"type":"podusage","total":..,"count":..,"feeds":[{feed,bytes,files},..]} —
+ * excludes *.part in-flight temp files (they are not usable downloads). */
+static void podusage_build(strbuf *b) {
+    char base[1400], pat[1600];
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    int64_t total = 0, count = 0;
+    bool first = true;
+
+    pod_dir_path(base, sizeof(base), NULL);
+    sb_puts(b, "{\"type\":\"podusage\",\"feeds\":[");
+    snprintf(pat, sizeof(pat), "%s\\*", base);
+    h = FindFirstFileA(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                strcmp(fd.cFileName, ".") != 0 &&
+                strcmp(fd.cFileName, "..") != 0) {
+                char sub[1600], spat[1800];
+                WIN32_FIND_DATAA sf;
+                HANDLE sh;
+                int64_t fbytes = 0, ffiles = 0;
+                snprintf(sub, sizeof(sub), "%s\\%s", base, fd.cFileName);
+                snprintf(spat, sizeof(spat), "%s\\*", sub);
+                sh = FindFirstFileA(spat, &sf);
+                if (sh != INVALID_HANDLE_VALUE) {
+                    do {
+                        size_t nl = strlen(sf.cFileName);
+                        if (!(sf.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                            !(nl > 5 && _stricmp(sf.cFileName + nl - 5,
+                                                 ".part") == 0)) {
+                            fbytes += ((int64_t)sf.nFileSizeHigh << 32) |
+                                      sf.nFileSizeLow;
+                            ffiles++;
+                        }
+                    } while (FindNextFileA(sh, &sf));
+                    FindClose(sh);
+                }
+                if (ffiles > 0) {
+                    if (!first) sb_putc(b, ',');
+                    first = false;
+                    sb_puts(b, "{\"feed\":");  sb_json_str(b, fd.cFileName);
+                    sb_puts(b, ",\"bytes\":"); sb_json_i64(b, fbytes);
+                    sb_puts(b, ",\"files\":"); sb_json_i64(b, ffiles);
+                    sb_putc(b, '}');
+                }
+                total += fbytes;
+                count += ffiles;
+            }
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    sb_puts(b, "],\"total\":"); sb_json_i64(b, total);
+    sb_puts(b, ",\"count\":");  sb_json_i64(b, count);
+    sb_putc(b, '}');
+}
+
+/* ---- online_<name>.json persistence -------------------------------- */
+
+static bool online_name_ok(const char *s) {
+    size_t i, n;
+    if (!s || !s[0]) return false;
+    n = strlen(s);
+    if (n > 32) return false;
+    for (i = 0; i < n; ++i) {
+        char c = s[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'))
+            return false;
+    }
+    return true;
+}
+
+static void onlinefile_cmd(cef_frame_t *frame, const char *json, bool save) {
+    char name[48], file[64], path[1400];
+    if (!json_get_str(json, "name", name, sizeof(name)) ||
+        !online_name_ok(name)) {
+        if (!save && frame) frame->base.release(&frame->base);
+        return;
+    }
+    snprintf(file, sizeof(file), "online_%s.json", name);
+    datafile_path(path, sizeof(path), file);
+
+    if (save) {
+        char *text = json_get_str_alloc(json, "text");
+        char  tmp[1450];
+        FILE *f;
+        if (!text || strlen(text) > NE_ONLINE_CAP) { free(text); return; }
+        snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+        f = fopen(tmp, "wb");
+        if (f) {
+            size_t n = strlen(text);
+            bool wok = fwrite(text, 1, n, f) == n;
+            fclose(f);
+            if (wok) MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING);
+            else     DeleteFileA(tmp);
+        }
+        free(text);
+        return;
+    }
+
+    /* load -> {"type":"onlinefile","name":..,"text":..} (text "" when the
+     * file doesn't exist yet — the UI starts empty). */
+    {
+        strbuf b; sb_init(&b);
+        char  *text = NULL;
+        FILE  *f = fopen(path, "rb");
+        if (f) {
+            long sz;
+            fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
+            if (sz > 0 && sz <= (long)NE_ONLINE_CAP) {
+                text = (char *)malloc((size_t)sz + 1);
+                if (text) {
+                    size_t rd = fread(text, 1, (size_t)sz, f);
+                    text[rd] = 0;
+                }
+            }
+            fclose(f);
+        }
+        sb_puts(&b, "{\"type\":\"onlinefile\",\"name\":");
+        sb_json_str(&b, name);
+        sb_puts(&b, ",\"text\":");
+        sb_json_str(&b, text ? text : "");
+        sb_putc(&b, '}');
+        if (!b.oom && frame) {
+            post_emit_owned(frame, b.data);
+        } else {
+            sb_free(&b);
+            if (frame) frame->base.release(&frame->base);
+        }
+        free(text);
+    }
+}
+
 static int books_read(ne_book_line *out, int max) {
     char  f[1400], line[256];
     FILE *bf;

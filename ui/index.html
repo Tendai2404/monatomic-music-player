@@ -48,6 +48,12 @@
         <div class="nav-label">Audiobooks</div>
         <button class="nav-item" data-view="audiobooks"><span class="nav-ico">◈</span>Audiobooks</button>
       </div>
+      <div class="nav-group">
+        <div class="nav-label">Online</div>
+        <button class="nav-item" data-view="radio"><span class="nav-ico">◉</span>Radio</button>
+        <button class="nav-item" data-view="podcasts"><span class="nav-ico">◍</span>Podcasts</button>
+        <button class="nav-item" data-view="streams"><span class="nav-ico">≋</span>Streams</button>
+      </div>
       <!-- custom folder designations (ost, podcast, …) — filled by on("kinds") -->
       <div class="nav-group" id="nav-custom-kinds" hidden>
         <div class="nav-label">Libraries</div>
@@ -238,6 +244,12 @@
       <div id="view-lyrics" class="view-panel" hidden>
         <div id="lyrics-root" class="lyrics-root"></div>
       </div>
+
+      <!-- Online: internet radio / saved streams / podcasts (modules own
+           these panels' contents — MnRadio / MnStreams / MnPodcasts). -->
+      <div id="view-radio" class="view-panel" hidden></div>
+      <div id="view-streams" class="view-panel" hidden></div>
+      <div id="view-podcasts" class="view-panel" hidden></div>
 
       <!-- MEDIA MANAGER (separate power-tool module; rendered by mediatool.js) -->
       <div id="view-mediatool" class="view-panel" hidden></div>
@@ -1093,6 +1105,9 @@
 <script src="rearrange.js"></script>
 <script src="models.js"></script>
 <script src="lyrics.js"></script>
+<script src="streams.js"></script>
+<script src="radio.js"></script>
+<script src="podcasts.js"></script>
 <script src="mediatool.js"></script>
 <script src="artedit.js"></script>
 <script src="tagedit.js"></script>

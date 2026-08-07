@@ -50,6 +50,14 @@ extern ma_decoding_backend_vtable g_mn_decoding_backend_ffmpeg;
 void mn_decode_config_apply_backends(ma_decoder_config *cfg);
 
 /*
+ * AAC/M4A over HTTP: install the MF-over-URL backend on `cfg` and stash
+ * `url` for its onInit (one-shot; engine loads are serialized). The
+ * subsequent ma_decoder_init()'s read callbacks are ignored — Media
+ * Foundation streams the URL itself (progressive download, Range seek).
+ */
+void mn_decode_config_apply_mf_url(ma_decoder_config *cfg, const char *url);
+
+/*
  * One-time process init/teardown for the decode backends (e.g. MFStartup).
  * mn_decode_backends_init() is idempotent and thread-safe-ish (call from the
  * main thread before first decode). Not strictly required — the MF backend

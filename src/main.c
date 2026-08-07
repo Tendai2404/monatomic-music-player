@@ -15,6 +15,7 @@
 #include "tags_write.h"
 #include "artcache.h"
 #include "modeldl.h"
+#include "netstream.h"
 
 /* Compiled into artcache.c's stb_image_write implementation (extern there),
  * but not part of the header's public declaration block — declare it here. */
@@ -1671,6 +1672,51 @@ int main(int argc, char **argv) {
         return run_selftest(1);
     if (argc >= 2 && strcmp(argv[1], "--selftest-fast") == 0)
         return run_selftest(0);          /* skip the model load */
+
+    /* --nettest <url>: netstream harness — connect, print response facts,
+     * read a few hundred KB, report ICY titles. Isolates the streaming
+     * reader from the engine/UI for radio/podcast bring-up. */
+    if (argc >= 3 && strcmp(argv[1], "--nettest") == 0) {
+        char err[256] = {0};
+        mn_netstream *ns;
+        uint32_t seq = 0;
+        char title[512];
+        int64_t got_total = 0;
+        DWORD t0 = GetTickCount();
+        printf("nettest: %s\n", argv[2]);
+        ns = mn_netstream_open(argv[2], true, err, sizeof(err));
+        if (!ns) { printf("OPEN FAILED: %s\n", err); return 1; }
+        printf("  content-type: %s\n", mn_netstream_content_type(ns));
+        printf("  station:      %s\n", mn_netstream_station_name(ns));
+        printf("  length:       %lld  seekable=%d\n",
+               (long long)mn_netstream_length(ns),
+               mn_netstream_seekable(ns) ? 1 : 0);
+        {
+            char *buf = (char *)malloc(64 * 1024);
+            int i;
+            for (i = 0; i < 8 && buf; i++) {
+                size_t got = mn_netstream_read(ns, buf, 64 * 1024);
+                got_total += (int64_t)got;
+                if (mn_netstream_title(ns, title, sizeof(title), &seq))
+                    printf("  ICY title:    %s\n", title);
+                if (got == 0) { printf("  EOF/stall at %lld\n",
+                                       (long long)got_total); break; }
+            }
+            free(buf);
+        }
+        printf("  read %lld bytes in %lu ms\n", (long long)got_total,
+               (unsigned long)(GetTickCount() - t0));
+        mn_netstream_close(ns);
+        printf("NETTEST OK\n");
+        return 0;
+    }
+
+    /* --nettest2 <url>: netstream + decoder over callbacks — the exact
+     * path mn_engine_load_url takes, minus the device (implemented in
+     * audio_engine.c where the decoder internals live). */
+    if (argc >= 3 && strcmp(argv[1], "--nettest2") == 0) {
+        return mn_engine_nettest_decode(argv[2]);
+    }
     if (argc >= 2 && strcmp(argv[1], "--bench") == 0)
         return run_bench();
     if (argc >= 3 && strcmp(argv[1], "--arttest") == 0) {

@@ -240,6 +240,13 @@ typedef struct mn_now {
     float   stem_rt_factor;             /* realtime factor (x); >1 = faster*/
     float   stem_fraction;              /* 0..1 buffered/ready fraction   */
     float   stem_meters[MN_STEM_COUNT]; /* per-stem output level 0..1     */
+
+    /* online session (internet radio / streamed podcast) ----------- */
+    bool    online;                     /* engine is playing an HTTP source */
+    bool    online_live;                /* unseekable live mount (radio)    */
+    char    online_kind[12];            /* "radio" | "podcast" | "stream"   */
+    char    online_url[MN_STR_PATH];    /* source URL (or local file path)  */
+    char    stream_title[MN_STR_SHORT]; /* latest ICY StreamTitle, "" none  */
 } mn_now;
 
 /* ------------------------------------------------------------------ */
@@ -737,6 +744,18 @@ void mn_app_stem_solo(mn_app *app, int32_t stem, bool soloed);
 
 /* Fill *out with the current now-playing snapshot. */
 void mn_app_now(mn_app *app, mn_now *out);
+
+/* ---- Online session (internet radio / podcasts) ------------------- */
+/* Start playing an HTTP(S) stream or a downloaded episode file OUTSIDE
+ * the library queue. `kind` = "radio" | "podcast" | "stream"; radio gets
+ * ICY metadata. `local` plays `src` as a file path. Blocks on connect —
+ * worker thread only. On failure `err` (optional) has a short reason. */
+bool mn_app_online_play(mn_app *app, const char *src, const char *title,
+                        const char *artist, const char *kind,
+                        int64_t duration_ms, bool local,
+                        char *err, size_t err_cap);
+void mn_app_online_stop(mn_app *app);
+bool mn_app_online_active(mn_app *app);
 
 /* Like mn_app_now, but skips resolving out->art_path (left empty) and the
  * per-call fopen/stat it costs. For hot-path callers that never read the art

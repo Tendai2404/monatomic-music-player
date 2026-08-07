@@ -44,6 +44,9 @@ SOURCES = [
     os.path.join(SRC, "audio_engine.c"),
     # Pitch-preserved playback speed (WSOLA time-stretch; audiobooks).
     os.path.join(SRC, "stretch.c"),
+    # HTTP streaming source (internet radio / podcasts): WinHTTP ring buffer,
+    # ICY metadata, Range seek.
+    os.path.join(SRC, "netstream.c"),
     os.path.join(SRC, "mf_decode.c"),
     os.path.join(SRC, "tags.c"),
     os.path.join(SRC, "tags_write.c"),

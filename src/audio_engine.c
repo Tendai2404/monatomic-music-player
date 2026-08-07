@@ -34,6 +34,7 @@
 #include "mf_decode.h"
 #include "dsp.h"
 #include "stretch.h"
+#include "netstream.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -115,6 +116,17 @@ struct mn_engine {
      * load computes length from it and SKIPS ma_decoder_get_length —
      * a whole-file scan on big VBR files that stalled track switches. */
     int64_t       length_hint_ms;
+
+    /* Non-NULL while the loaded "track" is an HTTP stream (internet radio /
+     * streamed podcast episode). Owned; closed by mn_unload. While set, the
+     * decoder reads through netstream callbacks, stems/pipeline retunes are
+     * refused (there is no file to re-open), and seeking is gated on the
+     * stream being Range-seekable. */
+    mn_netstream *net;
+    /* Set for EVERY URL load — including the AAC/M4A path where Media
+     * Foundation streams the URL itself and `net` stays NULL. Guards the
+     * same invariants (no pipeline retune, no file re-open). */
+    ma_bool32     is_url;
 
     /* Post-mix DSP chain (EQ / balance / limiter / master gain). Owned.
      * Created lazily on first device open, reconfigured on rate changes.
@@ -295,6 +307,11 @@ static void mn_unload(mn_engine *engine)
         ma_decoder_uninit(&engine->decoder);
         engine->has_track = MA_FALSE;
     }
+    if (engine->net != NULL) {
+        mn_netstream_close(engine->net);
+        engine->net = NULL;
+    }
+    engine->is_url = MA_FALSE;
     engine->cursor          = 0;
     engine->length          = 0;
     engine->at_end          = MA_FALSE;
@@ -575,6 +592,14 @@ static mn_result mn_reopen_decoder(mn_engine *engine, uint32_t rate, uint64_t po
     if (!engine->has_track || engine->track_path[0] == '\0') {
         ma_mutex_unlock(&engine->lock);
         return MN_ERR_STATE;
+    }
+    if (engine->is_url) {
+        /* HTTP stream (either path): there is no file to re-open at another
+         * rate, and the live connection would be lost. Leave the pipeline
+         * exactly as it is (streams run stems-less at a fixed rate) and
+         * report success so the caller never unloads a playing stream. */
+        ma_mutex_unlock(&engine->lock);
+        return MN_OK;
     }
 
     ma_decoder_uninit(&engine->decoder);
@@ -1451,6 +1476,321 @@ mn_result mn_engine_load(mn_engine *engine, const char *path)
     return MN_OK;
 }
 
+/* ---- HTTP stream loading (internet radio / streamed podcasts) --------- */
+
+static int g_net_trace = 0;   /* --nettest2 verbosity */
+
+static ma_result mn_net_on_read(ma_decoder *dec, void *out, size_t bytes,
+                                size_t *bytes_read)
+{
+    mn_netstream *ns = (mn_netstream *)dec->pUserData;
+    size_t got = mn_netstream_read(ns, out, bytes);
+    if (g_net_trace) printf("    on_read(%zu) -> %zu\n", bytes, got);
+    if (bytes_read) *bytes_read = got;
+    if (got == 0) return MA_AT_END;
+    return MA_SUCCESS;
+}
+
+static ma_result mn_net_on_seek(ma_decoder *dec, ma_int64 offset,
+                                ma_seek_origin origin)
+{
+    mn_netstream *ns = (mn_netstream *)dec->pUserData;
+    int64_t target;
+    int64_t cur = mn_netstream_tell(ns);
+    int64_t len = mn_netstream_length(ns);
+
+    switch (origin) {
+        case ma_seek_origin_start:   target = offset;       break;
+        case ma_seek_origin_current: target = cur + offset; break;
+        case ma_seek_origin_end:
+            if (len < 0) {
+                if (g_net_trace) printf("    on_seek(end%+lld) -> NOT_IMPL (live)\n",
+                                        (long long)offset);
+                return MA_NOT_IMPLEMENTED;
+            }
+            target = len + offset;
+            break;
+        default: return MA_INVALID_ARGS;
+    }
+    if (g_net_trace) printf("    on_seek(origin=%d off=%lld cur=%lld -> %lld)\n",
+                            (int)origin, (long long)offset, (long long)cur,
+                            (long long)target);
+    if (target == cur) return MA_SUCCESS;       /* no-op probes are fine */
+    /* netstream resolves: buffered-ahead skip, history rewind (live-safe),
+     * or an HTTP Range re-request (seekable only). */
+    if (mn_netstream_seek(ns, target)) return MA_SUCCESS;
+    if (!mn_netstream_seekable(ns) && target > cur &&
+        target - cur <= 256 * 1024) {
+        /* Live mount, small FORWARD skip beyond the buffer: consume. */
+        char scratch[4096];
+        int64_t left = target - cur;
+        while (left > 0) {
+            size_t got = mn_netstream_read(ns, scratch,
+                    left < (int64_t)sizeof(scratch) ? (size_t)left
+                                                    : sizeof(scratch));
+            if (got == 0) return MA_AT_END;
+            left -= (int64_t)got;
+        }
+        return MA_SUCCESS;
+    }
+    return MA_NOT_IMPLEMENTED;
+}
+
+/* Map a Content-Type (already lowercased) / URL to a miniaudio encoding.
+ * Returns ma_encoding_format_unknown for containers we cannot decode over
+ * a socket yet (AAC/MP4 need the MF byte-stream bridge). */
+static ma_encoding_format mn_net_encoding(const char *ctype, const char *url)
+{
+    if (strstr(ctype, "mpeg") || strstr(ctype, "mp3") || strstr(ctype, "mpg"))
+        return ma_encoding_format_mp3;
+    if (strstr(ctype, "flac"))
+        return ma_encoding_format_flac;
+    if (strstr(ctype, "wav"))
+        return ma_encoding_format_wav;
+    if (strstr(ctype, "aac") || strstr(ctype, "mp4") || strstr(ctype, "m4a"))
+        return ma_encoding_format_unknown;   /* MF bridge territory */
+    /* No usable type (octet-stream / missing): guess from the URL. */
+    {
+        const char *q = strchr(url, '?');
+        size_t n = q ? (size_t)(q - url) : strlen(url);
+        if (n >= 4 && _strnicmp(url + n - 4, ".mp3", 4) == 0)
+            return ma_encoding_format_mp3;
+        if (n >= 5 && _strnicmp(url + n - 5, ".flac", 5) == 0)
+            return ma_encoding_format_flac;
+        if (n >= 4 && (_strnicmp(url + n - 4, ".aac", 4) == 0 ||
+                       _strnicmp(url + n - 4, ".m4a", 4) == 0 ||
+                       _strnicmp(url + n - 4, ".mp4", 4) == 0))
+            return ma_encoding_format_unknown;
+    }
+    /* Ambiguous (octet-stream / missing / unrecognised): route to the
+     * MF-URL path — Media Foundation sniffs the container itself and
+     * handles MP3 as well as AAC/MP4. Guessing mp3 here once sent a live
+     * AAC stream into dr_mp3's sync scan, which never terminates on an
+     * endless source. Only the ICY song-title nicety is lost. */
+    return ma_encoding_format_unknown;
+}
+
+mn_result mn_engine_load_url(mn_engine *engine, const char *url, int want_icy,
+                             char *err, size_t err_cap)
+{
+    ma_decoder_config dcfg;
+    ma_result mr;
+    mn_netstream *ns;
+    ma_encoding_format enc;
+
+    if (err && err_cap) err[0] = 0;
+    if (engine == NULL || url == NULL || url[0] == '\0') {
+        return MN_ERR_INVALID;
+    }
+    if (!engine->device_ready) {
+        return MN_ERR_STATE;
+    }
+
+    /* Connect FIRST (blocking, seconds) so a failed connect never tears the
+     * current track down. Caller must be a worker thread. */
+    ns = mn_netstream_open(url, want_icy ? true : false, err, err_cap);
+    if (ns == NULL) {
+        return MN_ERR_OPEN;
+    }
+    enc = mn_net_encoding(mn_netstream_content_type(ns), url);
+    if (enc == ma_encoding_format_unknown) {
+        /* AAC/MP4: Media Foundation streams the URL itself (progressive
+         * download, ADTS/MP4 demux, Range seek). The netstream probe is no
+         * longer needed — MF makes its own clean connection (no ICY). */
+        mn_netstream_close(ns);
+        ns = NULL;
+    } else {
+        /* Pre-roll so the decoder header probe + first render never starve:
+         * ~6 s of a 128 kbps stream, or the whole file if smaller. */
+        mn_netstream_wait_buffered(ns, 96 * 1024, 10000);
+    }
+
+    ma_device_stop(&engine->device);
+    ma_mutex_lock(&engine->lock);
+    mn_unload(engine);
+
+    /* Streams decode at a FIXED 44100/stereo pipeline — predictable device
+     * behaviour, no native-rate probe (that would need a second connect). */
+    dcfg = ma_decoder_config_init(ma_format_f32, MN_ENGINE_CHANNELS,
+                                  MN_ENGINE_SAMPLE_RATE);
+    if (ns != NULL) {
+        dcfg.encodingFormat = enc;
+        mr = ma_decoder_init(mn_net_on_read, mn_net_on_seek, ns, &dcfg,
+                             &engine->decoder);
+    } else {
+        mn_decode_config_apply_mf_url(&dcfg, url);
+        mr = ma_decoder_init(mn_net_on_read, mn_net_on_seek, NULL, &dcfg,
+                             &engine->decoder);
+    }
+    if (mr != MA_SUCCESS) {
+        ma_mutex_unlock(&engine->lock);
+        if (ns) mn_netstream_close(ns);
+        if (err && !err[0]) snprintf(err, err_cap, "stream decode failed");
+        return (mr == MA_NOT_IMPLEMENTED || mr == MA_INVALID_FILE)
+                   ? MN_ERR_UNSUPPORTED : MN_ERR_OPEN;
+    }
+
+    engine->is_url    = MA_TRUE;
+    engine->net       = ns;
+    engine->has_track = MA_TRUE;
+    engine->cursor    = 0;
+    engine->at_end    = MA_FALSE;
+    engine->pipe_rate = MN_ENGINE_SAMPLE_RATE;
+    engine->pipe_channels = MN_ENGINE_CHANNELS;
+    engine->downmixed = MA_FALSE;
+    engine->src_sample_rate = (uint32_t)engine->decoder.converter.sampleRateIn;
+    engine->src_channels    = (uint32_t)engine->decoder.converter.channelsIn;
+    engine->src_bits        = mn_bits_from_format(engine->decoder.converter.formatIn);
+    engine->bitrate = 0;
+    if (engine->stretch != NULL) mn_stretch_reset(engine->stretch);
+
+    strncpy(engine->track_path, url, sizeof(engine->track_path) - 1);
+    engine->track_path[sizeof(engine->track_path) - 1] = '\0';
+
+    /* Duration: the RSS hint for podcasts, unknown (0) for live radio.
+     * netstream path: NEVER ma_decoder_get_length — for MP3 that scans the
+     * whole "file", i.e. downloads the entire episode before playing.
+     * MF path: the reader knows the duration from container metadata, so
+     * the query is cheap and correct (M4A podcast seek bars work). */
+    if (engine->length_hint_ms > 0) {
+        engine->length = mn_ms_to_frames((uint64_t)engine->length_hint_ms,
+                                         MN_ENGINE_SAMPLE_RATE);
+    } else if (ns == NULL) {
+        ma_uint64 mlen = 0;
+        if (ma_decoder_get_length_in_pcm_frames(&engine->decoder,
+                                                &mlen) == MA_SUCCESS) {
+            engine->length = (uint64_t)mlen;
+        } else {
+            engine->length = 0;
+        }
+    } else {
+        engine->length = 0;
+    }
+    engine->length_hint_ms = 0;
+
+    snprintf(engine->format, sizeof(engine->format), "%s",
+             ns == NULL ? "AAC" :
+             enc == ma_encoding_format_mp3 ? "MP3" :
+             enc == ma_encoding_format_flac ? "FLAC" : "STREAM");
+
+    engine->state = MN_STATE_STOPPED;
+    ma_mutex_unlock(&engine->lock);
+
+    if (mn_sync_device_rate(engine) != MN_OK) {
+        ma_mutex_lock(&engine->lock);
+        mn_unload(engine);
+        ma_mutex_unlock(&engine->lock);
+        return MN_ERR_DEVICE;
+    }
+    return MN_OK;
+}
+
+/* Diagnostic harness for --nettest2: the exact callback-decoder path
+ * mn_engine_load_url takes, minus the device. Prints the raw ma_result. */
+int mn_engine_nettest_decode_one(const char *url, int want_icy);
+int mn_engine_nettest_decode(const char *url)
+{
+    int a, b;
+    printf("== with ICY metadata ==\n");
+    a = mn_engine_nettest_decode_one(url, 1);
+    printf("== without ICY metadata ==\n");
+    b = mn_engine_nettest_decode_one(url, 0);
+    return (a == 0 && b == 0) ? 0 : 1;
+}
+
+int mn_engine_nettest_decode_one(const char *url, int want_icy)
+{
+    char err[256] = {0};
+    mn_netstream *ns = mn_netstream_open(url, want_icy ? true : false,
+                                         err, sizeof(err));
+    ma_decoder dec;
+    ma_decoder_config cfg;
+    ma_result mr;
+    ma_encoding_format enc;
+
+    if (!ns) { printf("OPEN FAILED: %s\n", err); return 1; }
+    printf("content-type: %s\n", mn_netstream_content_type(ns));
+    enc = mn_net_encoding(mn_netstream_content_type(ns), url);
+    printf("encoding pick: %d (0=MF-url 2=flac 3=mp3)\n", (int)enc);
+
+    cfg = ma_decoder_config_init(ma_format_f32, 2, 44100);
+    if (enc == ma_encoding_format_unknown) {
+        /* Mirror the engine: MF streams the URL itself. */
+        mn_netstream_close(ns);
+        ns = NULL;
+        mn_decode_config_apply_mf_url(&cfg, url);
+        g_net_trace = 1;
+        mr = ma_decoder_init(mn_net_on_read, mn_net_on_seek, NULL, &cfg, &dec);
+        g_net_trace = 0;
+        printf("decoder init (MF-url): %d (%s)\n", (int)mr,
+               mr == MA_SUCCESS ? "OK" : ma_result_description(mr));
+        if (mr == MA_SUCCESS) {
+            float *buf = (float *)malloc(sizeof(float) * 4096 * 2);
+            ma_uint64 frames = 0, total = 0;
+            int i;
+            for (i = 0; i < 10 && buf; i++) {
+                if (ma_decoder_read_pcm_frames(&dec, buf, 4096, &frames)
+                        != MA_SUCCESS) break;
+                total += frames;
+            }
+            printf("decoded %llu frames (%.1f s of audio)\n",
+                   (unsigned long long)total, (double)total / 44100.0);
+            free(buf);
+            ma_decoder_uninit(&dec);
+        }
+        return (mr == MA_SUCCESS) ? 0 : 1;
+    }
+    printf("buffered: %zu\n", mn_netstream_wait_buffered(ns, 96 * 1024, 10000));
+    cfg.encodingFormat = enc;
+    g_net_trace = 1;
+    mr = ma_decoder_init(mn_net_on_read, mn_net_on_seek, ns, &cfg, &dec);
+    g_net_trace = 0;
+    printf("decoder init: %d (%s)\n", (int)mr,
+           mr == MA_SUCCESS ? "OK" : ma_result_description(mr));
+    if (mr == MA_SUCCESS) {
+        float *buf = (float *)malloc(sizeof(float) * 4096 * 2);
+        ma_uint64 frames = 0, total = 0;
+        int i;
+        for (i = 0; i < 10 && buf; i++) {
+            if (ma_decoder_read_pcm_frames(&dec, buf, 4096, &frames)
+                    != MA_SUCCESS) break;
+            total += frames;
+        }
+        printf("decoded %llu frames (%.1f s of audio)\n",
+               (unsigned long long)total, (double)total / 44100.0);
+        free(buf);
+        ma_decoder_uninit(&dec);
+    }
+    mn_netstream_close(ns);
+    return (mr == MA_SUCCESS) ? 0 : 1;
+}
+
+int mn_engine_is_stream(mn_engine *engine)
+{
+    return (engine != NULL && engine->is_url) ? 1 : 0;
+}
+
+int mn_engine_stream_seekable(mn_engine *engine)
+{
+    if (engine == NULL || !engine->is_url) return 0;
+    if (engine->net != NULL) return mn_netstream_seekable(engine->net) ? 1 : 0;
+    /* MF-URL path: seekable when the container reported a duration. */
+    return engine->length > 0 ? 1 : 0;
+}
+
+int mn_engine_stream_title(mn_engine *engine, char *out, size_t cap,
+                           uint32_t *seq)
+{
+    if (engine == NULL || engine->net == NULL) return 0;
+    return mn_netstream_title(engine->net, out, cap, seq) ? 1 : 0;
+}
+
+const char *mn_engine_stream_station(mn_engine *engine)
+{
+    if (engine == NULL || engine->net == NULL) return "";
+    return mn_netstream_station_name(engine->net);
+}
+
 mn_result mn_engine_play(mn_engine *engine)
 {
     if (engine == NULL) {
@@ -1513,9 +1853,14 @@ mn_result mn_engine_stop(mn_engine *engine)
     engine->state = MN_STATE_STOPPED;
     ma_device_stop(&engine->device);
 
-    /* Rewind to the beginning; the track stays loaded and replayable. */
+    /* Rewind to the beginning; the track stays loaded and replayable.
+     * LIVE mounts have no beginning — skip the decoder seek (it would
+     * fail) and let a resume continue at the live edge. */
     ma_mutex_lock(&engine->lock);
-    ma_decoder_seek_to_pcm_frame(&engine->decoder, 0);
+    if (!(engine->is_url && engine->net != NULL &&
+          !mn_netstream_seekable(engine->net))) {
+        ma_decoder_seek_to_pcm_frame(&engine->decoder, 0);
+    }
     engine->cursor = 0;
     engine->at_end = MA_FALSE;
     if (engine->stretch != NULL) mn_stretch_reset(engine->stretch);
@@ -1572,6 +1917,13 @@ mn_result mn_engine_seek_ms(mn_engine *engine, uint64_t position_ms)
     }
     if (!engine->device_ready || !engine->has_track) {
         return MN_ERR_STATE;
+    }
+
+    /* Live streams have no timeline — quietly ignore the seek instead of
+     * ending the stream via a failed decoder seek. Covers both the
+     * netstream path (unseekable mount) and the MF-URL path (length 0). */
+    if (engine->is_url && !mn_engine_stream_seekable(engine)) {
+        return MN_OK;
     }
 
     /* Clamp to [0, duration]. */

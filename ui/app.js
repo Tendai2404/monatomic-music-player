@@ -3073,7 +3073,7 @@
      VIEW SWITCHING
      ============================================================ */
   function showPanel(id) {
-    ["view-tracks", "view-albums", "view-facet", "view-playlists", "view-folders", "view-generic", "view-models", "view-lyrics", "view-stats", "view-search", "view-mediatool"].forEach((p) => { const e = $("#" + p); if (e) e.hidden = (p !== id); });
+    ["view-tracks", "view-albums", "view-facet", "view-playlists", "view-folders", "view-generic", "view-models", "view-lyrics", "view-stats", "view-search", "view-mediatool", "view-radio", "view-streams", "view-podcasts"].forEach((p) => { const e = $("#" + p); if (e) e.hidden = (p !== id); });
     if (id !== "view-search") state.searchOpen = false;
   }
   /* titleFx channel: every title change funnels through here — scramble
@@ -3097,6 +3097,9 @@
     if (state.view === "lyrics") { applyTitle("Lyrics"); return; }
     if (state.view === "stats")  { applyTitle("Statistics"); return; }
     if (state.view === "mediatool") { applyTitle("Media Manager"); return; }
+    if (state.view === "radio")    { applyTitle("Radio"); return; }
+    if (state.view === "streams")  { applyTitle("Streams"); return; }
+    if (state.view === "podcasts") { applyTitle("Podcasts"); return; }
     if (state.activeKind && state.view === 1) {
       const c = state.albTotal || 0;
       const lbl = kindLabel(state.activeKind);
@@ -4502,8 +4505,19 @@
   }
 
   E.btnPlay.addEventListener("click", () => send({ cmd: "toggle" }));
-  E.btnPrev.addEventListener("click", () => send({ cmd: "prev" }));
-  E.btnNext.addEventListener("click", () => send({ cmd: "next" }));
+  /* Radio sessions own next/prev (station surfing through the module's
+     query list); the C side no-ops those cmds while online, so route the
+     buttons to the radio module instead of the parked library queue. */
+  function onlineNextPrev(dir) {
+    const n = state.now || {};
+    if (n.online && n.online_kind === "radio" && window.MnRadio) {
+      if (dir > 0 && MnRadio.next) { MnRadio.next(); return true; }
+      if (dir < 0 && MnRadio.prev) { MnRadio.prev(); return true; }
+    }
+    return false;
+  }
+  E.btnPrev.addEventListener("click", () => { if (!onlineNextPrev(-1)) send({ cmd: "prev" }); });
+  E.btnNext.addEventListener("click", () => { if (!onlineNextPrev(1)) send({ cmd: "next" }); });
   E.btnShuffle.addEventListener("click", () => {
     const on = !(state.now && state.now.shuffle);
     send({ cmd: "shuffle", on });
@@ -7141,6 +7155,12 @@
   $$(".nav-item").forEach((n) => n.addEventListener("click", () => {
     const dv = n.dataset.view;
     if (dv === "audiobooks") { openAudiobooksView(); return; }
+    /* Online views live OUTSIDE the library — like audiobooks they must not
+       reset the active kind/category (leaving them returns you where you
+       were). */
+    if (dv === "radio")    { openOnlineView("radio");    return; }
+    if (dv === "streams")  { openOnlineView("streams");  return; }
+    if (dv === "podcasts") { openOnlineView("podcasts"); return; }
     navClearSearchContext();   /* sidebar = fresh, unfiltered view */
     setCategoryMode("");       /* any other destination is the MUSIC library */
     if (dv === "models") { openModelsView(); return; }
@@ -7151,6 +7171,20 @@
     if (dv && dv.indexOf("cat:") === 0) { openCategory(dv.slice(4)); return; }
     switchView(+dv);
   }));
+
+  /* Online views (internet radio / saved streams / podcasts): string-keyed
+     views mounted by their modules — MnRadio / MnStreams / MnPodcasts. */
+  function openOnlineView(which) {
+    state.view = which;
+    try { localStorage.setItem("mn.lastview", which); } catch (_) {}
+    $$(".nav-item").forEach((n) => n.classList.toggle("active", n.dataset.view === which));
+    showPanel("view-" + which);
+    updateViewTitle();
+    const mod = which === "radio" ? window.MnRadio :
+                which === "streams" ? window.MnStreams : window.MnPodcasts;
+    if (mod && mod.open) mod.open(modApi);
+    if (typeof window.__mnNavPush === "function") window.__mnNavPush();
+  }
 
   /* Media Manager: separate power-tool module (mediatool.js). */
   function openMediaToolView() {
@@ -7815,13 +7849,20 @@
        and the kind still exists as a sidebar section (checked once kinds
        arrive). Falls back to the numeric view otherwise. */
     const lastKind = localStorage.getItem("mn.lastkind");
-    if (lastKind && !(pref === "0" || pref === "1")) {
+    if ((saved === "radio" || saved === "streams" || saved === "podcasts") &&
+        !(pref === "0" || pref === "1")) {
+      /* Online views restore directly (no library/kind involvement). */
+      openOnlineView(saved);
+    } else if (lastKind && !(pref === "0" || pref === "1")) {
       state._pendingBootKind = lastKind;   /* openKindView once "kinds" confirms it */
       switchView(bootView === 1 ? 1 : bootView);   /* provisional; kind view applied below */
     } else {
       switchView(bootView);
     }
   }
+  /* Streams store loads at boot regardless of view — radio's star buttons
+     need the saved-URLs set before the Streams pane is ever opened. */
+  if (window.MnStreams && MnStreams.init) MnStreams.init(modApi);
   send({ cmd: "scan" });
   send({ cmd: "settings" });
   send({ cmd: "folders" });   /* hidden-folder banner state (graceful if unanswered) */

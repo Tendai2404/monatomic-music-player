@@ -601,6 +601,49 @@ ma_decoding_backend_vtable g_mn_decoding_backend_mf = {
     mn_mf_onUninit
 };
 
+/* ---- MF-over-URL backend (AAC/M4A internet streams + episodes) ---------
+ * Media Foundation's source resolver speaks http(s) natively (progressive
+ * download, byte-range seek, ADTS/MP4 demux) — everything the callback
+ * decoder path cannot do for AAC. ma_decoder has no URL init, so the URL
+ * rides a one-shot side channel: mn_decode_config_apply_mf_url() stashes
+ * it and installs this vtable; its onInit IGNORES the read callbacks and
+ * opens the stashed URL directly. Engine loads are serialized on the
+ * control thread, so the single pending slot cannot race. */
+static char g_mf_pending_url[2048];
+
+static ma_result mn_mf_onInitStreamURL(void *pUserData,
+        ma_read_proc onRead, ma_seek_proc onSeek, ma_tell_proc onTell,
+        void *pReadSeekTellUserData,
+        const ma_decoding_backend_config *pConfig,
+        const ma_allocation_callbacks *pAlloc, ma_data_source **ppBackend)
+{
+    wchar_t *w;
+    ma_result rc;
+    (void)pUserData; (void)onRead; (void)onSeek; (void)onTell;
+    (void)pReadSeekTellUserData;
+    if (g_mf_pending_url[0] == '\0') return MA_NO_BACKEND;
+    w = mn_utf8_to_wide(g_mf_pending_url);
+    if (w == NULL) return MA_NO_BACKEND;
+    rc = mn_mf_init_common(w, pConfig, pAlloc, ppBackend);
+    free(w);
+    return rc;
+}
+
+static ma_decoding_backend_vtable g_mn_backend_mf_url = {
+    mn_mf_onInitStreamURL,
+    NULL, NULL, NULL,
+    mn_mf_onUninit
+};
+static ma_decoding_backend_vtable *g_mf_url_chain[] = { &g_mn_backend_mf_url };
+
+void mn_decode_config_apply_mf_url(ma_decoder_config *cfg, const char *url)
+{
+    snprintf(g_mf_pending_url, sizeof(g_mf_pending_url), "%s", url);
+    cfg->ppCustomBackendVTables = g_mf_url_chain;
+    cfg->customBackendCount     = 1;
+    cfg->pCustomBackendUserData = NULL;
+}
+
 /* ------------------------------------------------------------------------- */
 /* ffmpeg fallback backend                                                    */
 /*                                                                            */
@@ -838,6 +881,9 @@ void mn_decode_config_apply_backends(ma_decoder_config *cfg)
 void mn_decode_backends_init(void)     {}
 void mn_decode_backends_shutdown(void) {}
 void mn_decode_config_apply_backends(ma_decoder_config *cfg) { (void)cfg; }
+void mn_decode_config_apply_mf_url(ma_decoder_config *cfg, const char *url) {
+    (void)cfg; (void)url;
+}
 
 ma_decoding_backend_vtable g_mn_decoding_backend_mf     = {0};
 ma_decoding_backend_vtable g_mn_decoding_backend_ffmpeg = {0};

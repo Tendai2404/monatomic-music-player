@@ -352,6 +352,20 @@ struct mn_app {
     char    now_path[MN_STR_PATH];       /* playing track's file path     */
     int32_t now_liked;                   /* thumbs state of the active track */
 
+    /* ---- Online session (internet radio / streamed podcast) ---- */
+    /* When active, the ENGINE is driven directly (mn_playback is stopped
+     * and its queue left untouched); the now-snapshot override below is
+     * what the transport renders. */
+    struct {
+        bool     active;
+        char     kind[12];               /* "radio" | "podcast" | "stream" */
+        char     title[MN_STR_SHORT];    /* station / episode title        */
+        char     artist[MN_STR_SHORT];   /* subtitle / feed title          */
+        char     url[MN_STR_PATH];
+        char     icy[MN_STR_SHORT];      /* latest StreamTitle             */
+        uint32_t icy_seq;
+    } online;
+
     /* ---- Mixer / mode state we own on the app side ---- */
     float   volume;
     bool    stems_enabled;
@@ -4457,6 +4471,9 @@ void mn_app_play_row(mn_app *app, int64_t row_id)
         return;
     }
     MN_LOCK(&app->lib_lock);
+    /* Playing a library row always ENDS an online session — otherwise the
+     * now-snapshot override would keep masking the real queue. */
+    app->online.active = false;
     ok = mn_app_play_from_query(app, row_id);
     if (!ok) {
         alb = mn_library_track_album_id(app->lib, row_id);
@@ -4552,6 +4569,7 @@ void mn_app_play_album_track(mn_app *app, int64_t album_id, int64_t track_id)
     }
 
     MN_LOCK(&app->lib_lock);
+    app->online.active = false;   /* library play ends an online session */
     memset(&spec, 0, sizeof(spec));
     spec.cascade[0].dim = MN_FACET_ALBUM;
     spec.cascade[0].value_id = album_id;
@@ -4704,6 +4722,17 @@ void mn_app_toggle_pause(mn_app *app)
         return;
     }
     MN_LOCK(&app->lib_lock);
+    if (app->online.active && app->engine) {
+        /* Online session: pause/resume the engine directly — the parked
+         * library queue must NOT restart from a transport toggle. */
+        if (mn_engine_state(app->engine) == MN_STATE_PLAYING) {
+            (void)mn_engine_pause(app->engine);
+        } else {
+            (void)mn_engine_play(app->engine);
+        }
+        MN_UNLOCK(&app->lib_lock);
+        return;
+    }
     (void)mn_playback_toggle_pause(app->pb);
     MN_UNLOCK(&app->lib_lock);
 }
@@ -4761,6 +4790,12 @@ void mn_app_next(mn_app *app)
         return;
     }
     MN_LOCK(&app->lib_lock);
+    if (app->online.active) {
+        /* Station/episode next is the UI module's job (its list, its
+         * order); advancing the parked library queue would hijack it. */
+        MN_UNLOCK(&app->lib_lock);
+        return;
+    }
     if (mn_playback_next(app->pb)) {
         mn_app_sync_current(app);
     }
@@ -4773,6 +4808,10 @@ void mn_app_prev(mn_app *app)
         return;
     }
     MN_LOCK(&app->lib_lock);
+    if (app->online.active) {
+        MN_UNLOCK(&app->lib_lock);
+        return;
+    }
     if (mn_playback_prev(app->pb)) {
         mn_app_sync_current(app);
     }
@@ -4785,8 +4824,111 @@ void mn_app_seek_ms(mn_app *app, int64_t position_ms)
         return;
     }
     MN_LOCK(&app->lib_lock);
-    (void)mn_playback_seek_ms(app->pb, (uint64_t)position_ms);
+    if (app->online.active && app->engine) {
+        (void)mn_engine_seek_ms(app->engine, (uint64_t)position_ms);
+    } else {
+        (void)mn_playback_seek_ms(app->pb, (uint64_t)position_ms);
+    }
     MN_UNLOCK(&app->lib_lock);
+}
+
+/* ------------------------------------------------------------------ */
+/* Online session (internet radio / podcasts)                          */
+/* ------------------------------------------------------------------ */
+
+bool mn_app_online_play(mn_app *app, const char *src, const char *title,
+                        const char *artist, const char *kind,
+                        int64_t duration_ms, bool local,
+                        char *err, size_t err_cap)
+{
+    mn_result r;
+    bool want_icy;
+
+    if (err && err_cap) err[0] = 0;
+    if (!app || !app->engine || !src || !src[0]) {
+        return false;
+    }
+    if (!kind || !kind[0]) kind = "stream";
+    want_icy = (strcmp(kind, "radio") == 0 || strcmp(kind, "stream") == 0);
+
+    /* Park the library queue: tick() then never touches the engine. The
+     * queue itself is left intact so ending the online session and playing
+     * a library row behaves exactly like any other new play. */
+    MN_LOCK(&app->lib_lock);
+    if (app->pb) {
+        mn_playback_stop(app->pb);
+    }
+    MN_UNLOCK(&app->lib_lock);
+
+    /* Connect + decode OUTSIDE the lock — this blocks for seconds and the
+     * UI thread must stay free to poll `now` (which shows the old state
+     * until we flip online.active below). */
+    if (duration_ms > 0) {
+        mn_engine_set_length_hint_ms(app->engine, duration_ms);
+    }
+    /* NOTE: engine MN_OK is masked here by the app.h/library_db.h alias
+     * dance — engine success is 0, every error negative. */
+    if (local) {
+        r = mn_engine_load(app->engine, src);
+        if (r != 0 && err && err_cap) {
+            snprintf(err, err_cap, "couldn't open the episode file");
+        }
+    } else {
+        r = mn_engine_load_url(app->engine, src, want_icy ? 1 : 0,
+                               err, err_cap);
+    }
+    if (r != 0) {
+        MN_LOCK(&app->lib_lock);
+        app->online.active = false;
+        MN_UNLOCK(&app->lib_lock);
+        return false;
+    }
+    (void)mn_engine_play(app->engine);
+
+    MN_LOCK(&app->lib_lock);
+    app->online.active  = true;
+    app->online.icy_seq = 0;
+    app->online.icy[0]  = '\0';
+    mn_copy_str(app->online.kind,   sizeof(app->online.kind),   kind);
+    mn_copy_str(app->online.title,  sizeof(app->online.title),
+                title && title[0] ? title : "Stream");
+    mn_copy_str(app->online.artist, sizeof(app->online.artist),
+                artist ? artist : "");
+    mn_copy_str(app->online.url,    sizeof(app->online.url),    src);
+    /* If the server sent a station name and the caller had none, use it. */
+    if ((!title || !title[0]) && app->engine) {
+        const char *sn = mn_engine_stream_station(app->engine);
+        if (sn && sn[0]) {
+            mn_copy_str(app->online.title, sizeof(app->online.title), sn);
+        }
+    }
+    MN_UNLOCK(&app->lib_lock);
+    return true;
+}
+
+void mn_app_online_stop(mn_app *app)
+{
+    if (!app) {
+        return;
+    }
+    MN_LOCK(&app->lib_lock);
+    if (app->online.active) {
+        app->online.active = false;
+        if (app->engine) {
+            (void)mn_engine_stop(app->engine);
+        }
+    }
+    MN_UNLOCK(&app->lib_lock);
+}
+
+bool mn_app_online_active(mn_app *app)
+{
+    bool a;
+    if (!app) return false;
+    MN_LOCK(&app->lib_lock);
+    a = app->online.active;
+    MN_UNLOCK(&app->lib_lock);
+    return a;
 }
 
 void mn_app_set_volume(mn_app *app, float volume)
@@ -5331,6 +5473,55 @@ static void mn_app_now_impl(mn_app *app, mn_now *out, bool want_art)
                 out->stem_meters[k] = meters[k];
             }
         }
+    }
+
+    /* ---- Online session override -------------------------------------
+     * The playback controller is stopped during an online session, so the
+     * standard fill above reported the OLD queue track + playing=false.
+     * Overwrite with the live stream's reality. */
+    if (app->online.active && app->engine) {
+        char icy[MN_STR_SHORT];
+        out->online = true;
+        mn_copy_str(out->online_kind, sizeof(out->online_kind),
+                    app->online.kind);
+        mn_copy_str(out->online_url, sizeof(out->online_url),
+                    app->online.url);
+        out->online_live = mn_engine_is_stream(app->engine) &&
+                           !mn_engine_stream_seekable(app->engine);
+        out->playing  = (mn_engine_state(app->engine) == MN_STATE_PLAYING);
+        out->track_id = 0;
+        out->album_id = 0;
+        out->liked    = 0;
+        out->track_path[0] = '\0';
+        out->art_path[0]   = '\0';
+        /* Latest ICY song title (radio): diffed by sequence so we only
+         * copy on change; cached for polls in between. */
+        if (mn_engine_stream_title(app->engine, icy, sizeof(icy),
+                                   &app->online.icy_seq)) {
+            mn_copy_str(app->online.icy, sizeof(app->online.icy), icy);
+        }
+        mn_copy_str(out->stream_title, sizeof(out->stream_title),
+                    app->online.icy);
+        if (strcmp(app->online.kind, "radio") == 0 && app->online.icy[0]) {
+            /* Song as the title, station as the artist line. */
+            mn_copy_str(out->track_title,  sizeof(out->track_title),
+                        app->online.icy);
+            mn_copy_str(out->track_artist, sizeof(out->track_artist),
+                        app->online.title);
+        } else {
+            mn_copy_str(out->track_title,  sizeof(out->track_title),
+                        app->online.title);
+            mn_copy_str(out->track_artist, sizeof(out->track_artist),
+                        app->online.artist);
+        }
+        mn_copy_str(out->track_album, sizeof(out->track_album),
+                    strcmp(app->online.kind, "podcast") == 0 ? "Podcasts" :
+                    strcmp(app->online.kind, "stream")  == 0 ? "Streams"
+                                                             : "Radio");
+        out->track_album_artist[0] = '\0';
+        /* Library-tag overrides above don't apply to a stream. */
+        out->stems_available = false;
+        out->stems_enabled   = false;
     }
     MN_UNLOCK(&app->lib_lock);
 }
