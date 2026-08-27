@@ -4048,8 +4048,11 @@ html[data-ui-tier="micro"] #app .seek-track{height:18px}
      chrome underneath it, with a little slack. */
   html[data-ui-tier="mini"] #app{
     grid-template-columns:minmax(0,1fr);
-    grid-template-rows:minmax(0,1fr) auto auto;
-    grid-template-areas:"art" "meta" "player";
+    /* 4th row for the stem sheet: `auto` collapses to zero height while the
+       sheet is closed (it is display:none), so a closed widget is laid out
+       exactly as before. */
+    grid-template-rows:minmax(0,1fr) auto auto auto;
+    grid-template-areas:"art" "meta" "player" "stems";
   }
   html[data-ui-tier="mini"] #app .np-art-wrap{grid-area:art;padding:12px 12px 6px}
   html[data-ui-tier="mini"] #app .np-meta{
@@ -4076,7 +4079,11 @@ html[data-ui-tier="micro"] #app .seek-track{height:18px}
      the meta and the player are placed into rows 2 and 3 ON TOP of it. */
   html[data-ui-tier="micro"] #app{
     grid-template-columns:minmax(0,1fr);
-    grid-template-rows:minmax(0,1fr) auto auto;
+    /* row 4 = the stem sheet (collapsed to 0 while closed). The cover is
+       absolutely positioned across the whole widget here, so the sheet sits
+       ON it rather than pushing it — capped below so the cover still reads
+       above the sheet. */
+    grid-template-rows:minmax(0,1fr) auto auto auto;
   }
   /* ABSOLUTE, not a spanning grid item, on purpose: a percentage height
      inside an item that spans `auto` tracks is indefinite in Chromium, so
@@ -4100,6 +4107,9 @@ html[data-ui-tier="micro"] #app .seek-track{height:18px}
   html[data-ui-tier="micro"] #app #player{
     grid-row:3;grid-column:1;z-index:3;background:var(--bg);
   }
+  html[data-ui-tier="micro"] #app .mini-stems.open .ms-sheet{
+    grid-row:4;grid-column:1;
+  }
   html[data-ui-tier="micro"] #app #np-art,
   html[data-ui-tier="micro"] #app #np-art-3d{border-radius:0}
 }
@@ -4113,8 +4123,11 @@ html[data-ui-tier="micro"] #app .seek-track{height:18px}
   html[data-ui-tier="mini"]  #app,
   html[data-ui-tier="micro"] #app{
     grid-template-columns:auto minmax(0,1fr);
-    grid-template-rows:auto auto;
-    grid-template-areas:"art meta" "art player";
+    grid-template-rows:auto auto auto;
+    /* the sheet spans BOTH columns on the strip: nine channels need the full
+       width, and putting it under the cover as well keeps the cover's row
+       from stretching to the sheet's height */
+    grid-template-areas:"art meta" "art player" "stems stems";
     align-content:center;
   }
   html[data-ui-tier="mini"]  #app{--mini-art:min(calc(100vh - 16px), 34vw, 340px)}
@@ -4233,19 +4246,28 @@ html[data-ui-tier="micro"] #app > .mini-stems.ms-off{display:none}
 .ms-mark{width:6px;height:6px;border-radius:2px;background:var(--grad-duo);flex:none}
 .mini-stems.live .ms-mark{box-shadow:0 0 8px var(--accent-glow)}
 
-/* ---- the sheet ---- */
+/* ---- the sheet ----
+   IN FLOW, as the LAST grid row — deliberately not an overlay. The sheet
+   used to be absolutely positioned at top:36px, directly over the cover;
+   opening the mixer hid the artwork, which is the one thing a now-playing
+   widget must never lose. As a real grid row below the transport/scrub bar
+   it PUSHES instead of covers: the art row is minmax(0,1fr) so the cover
+   shrinks to make room and stays visible the whole time.
+   Capped + internally scrollable so a short widget can still reach every
+   channel. */
 .ms-sheet{display:none}
 .mini-stems.open .ms-sheet{
   display:flex;flex-direction:column;gap:6px;
-  position:absolute;z-index:41;left:6px;right:6px;top:36px;
-  max-height:calc(100% - 44px);
-  padding:8px;border-radius:var(--r-lg);
+  grid-area:stems;z-index:41;
+  min-height:0;max-height:min(58vh,340px);overflow-y:auto;overscroll-behavior:contain;
+  margin:0 6px 6px;padding:8px;border-radius:var(--r-lg);
   background:color-mix(in srgb,var(--panel) 95%,transparent);
   border:1px solid var(--line-strong);
-  box-shadow:0 12px 34px rgba(0,0,0,.62);
+  box-shadow:0 -10px 28px rgba(0,0,0,.5);
   animation:ms-rise .2s var(--ease-out);
 }
-@keyframes ms-rise{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
+/* rises FROM the bottom edge now that it lives down there */
+@keyframes ms-rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
 
 .ms-head{display:flex;align-items:center;gap:6px;flex:none;min-width:0}
 .ms-sw{font-size:10px;gap:5px;flex:none}
@@ -4342,9 +4364,11 @@ html[data-ui-tier="micro"] #app > .mini-stems.ms-off{display:none}
   flex:1;min-width:0;height:17px;padding:0;border-radius:4px;font-size:9px;line-height:1;
 }
 
-/* ---- MICRO: no faders, 3-up rows, full-cover sheet ---- */
+/* ---- MICRO: no faders, 3-up rows ----
+   Capped hard here: micro is 320px tall at most, so an uncapped sheet would
+   swallow the cover entirely. 46vh leaves the artwork reading above it. */
 html[data-ui-tier="micro"] #app .mini-stems.open .ms-sheet{
-  top:6px;bottom:6px;max-height:none;
+  max-height:46vh;margin:0 5px 5px;padding:6px;
 }
 html[data-ui-tier="micro"] #app .ms-chans{grid-template-columns:repeat(3,minmax(0,1fr))}
 html[data-ui-tier="micro"] #app .ms-fader{display:none}
@@ -4353,8 +4377,9 @@ html[data-ui-tier="micro"] #app .ms-ch-name{flex:1;text-align:left;border-bottom
   border-left:2px solid var(--gcol,var(--muted-2));padding-left:4px}
 html[data-ui-tier="micro"] #app .ms-btns{width:auto;flex:none}
 html[data-ui-tier="micro"] #app .ms-ch .ms-btn{flex:none;width:20px}
-/* the sheet covers the toggle anyway — take it out of the tab order too */
-html[data-ui-tier="micro"] #app .mini-stems.open .ms-toggle{display:none}
+/* The toggle STAYS visible now. It used to be hidden because the sheet
+   covered it; the sheet lives below the scrub bar these days, so hiding it
+   would leave the pill's own close gesture unreachable. */
 
 /* ---- master: one horizontal track, shared setStemMaster ---- */
 .ms-master{display:flex;align-items:center;gap:6px;flex:none}
