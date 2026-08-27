@@ -2729,6 +2729,18 @@ static void dispatch_command(cef_frame_t *frame, const char *json) {
         /* Internet radio / podcast playback (worker thread; blocking net). */
         frame->base.add_ref(&frame->base);
         streamplay_start(frame, json);
+    } else if (strcmp(cmd, "alwaystop") == 0) {
+        /* Mini-player / widget mode: pin the window above everything else.
+         * Must run on the thread that owns the window — dispatch_command is
+         * already on the CEF UI thread, which is where g_host_hwnd was
+         * created, so SetWindowPos is safe here. SWP_NOACTIVATE keeps focus
+         * where the user put it. */
+        if (g_host_hwnd) {
+            bool on = json_get_bool(json, "on", false);
+            SetWindowPos(g_host_hwnd, on ? HWND_TOPMOST : HWND_NOTOPMOST,
+                         0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
     } else if (strcmp(cmd, "streamstop") == 0) {
         mn_app_online_stop(g_app);
     } else if (strcmp(cmd, "httpfetch") == 0) {

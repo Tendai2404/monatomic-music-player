@@ -144,17 +144,35 @@ typedef struct mn_biquad {
 /* Compute peaking-EQ coefficients (RBJ cookbook) for the given center
  * frequency, sample rate, Q and gain in dB, writing them into *bq without
  * touching the delay state. */
+static void mn_biquad_set_unity(mn_biquad *bq);   /* defined below */
+
 static void mn_biquad_set_peaking(mn_biquad *bq, float freq, float sample_rate,
                                   float q, float gain_db)
 {
-    double A     = pow(10.0, (double)gain_db / 40.0);
-    double w0    = 2.0 * MN_PI * (double)freq / (double)sample_rate;
-    double cosw0 = cos(w0);
-    double sinw0 = sin(w0);
-    double alpha = sinw0 / (2.0 * (double)q);
+    double A, w0, cosw0, sinw0, alpha, a0, inv;
 
-    double a0 = 1.0 + alpha / A;
-    double inv = 1.0 / a0;
+    /* NYQUIST GUARD. Above sample_rate/2 the bilinear form breaks down:
+     * sin(w0) goes NEGATIVE, which flips alpha's sign and drives a0 toward
+     * zero, so 1/a0 explodes and the filter oscillates instead of filtering.
+     * Measured on the real chain: the 16 kHz band on a 22.05 kHz audiobook
+     * produced +inf, and 11 kHz produced ~2.9e38 — heard as violently
+     * warbled/garbled audio the moment that band was boosted.
+     * A band that cannot exist at this rate is simply passed through; we
+     * stop at 0.45*rate because peaking sections near Nyquist are already
+     * numerically fragile in float even while nominally stable. */
+    if (!(sample_rate > 0.0f) || freq >= sample_rate * 0.45f) {
+        mn_biquad_set_unity(bq);
+        return;
+    }
+
+    A     = pow(10.0, (double)gain_db / 40.0);
+    w0    = 2.0 * MN_PI * (double)freq / (double)sample_rate;
+    cosw0 = cos(w0);
+    sinw0 = sin(w0);
+    alpha = sinw0 / (2.0 * (double)q);
+
+    a0  = 1.0 + alpha / A;
+    inv = 1.0 / a0;
 
     bq->b0 = (float)((1.0 + alpha * A) * inv);
     bq->b1 = (float)((-2.0 * cosw0) * inv);
@@ -747,14 +765,22 @@ mn_dsp_result mn_dsp_process(mn_dsp *dsp, float *buffer, uint32_t frames,
         uint32_t in_ch = dsp->in_channels;
         uint32_t stride = (out_ch > in_ch) ? out_ch : in_ch;
 
-        /* When upmixing (out_ch > in_ch) we must walk frames from last to first
-         * so writing a wider output frame never clobbers an input frame we have
-         * not read yet. When out_ch <= in_ch, forward is safe. */
-        int reverse = (out_ch > in_ch);
+        /* ALWAYS walk forward. This loop used to run last-to-first when
+         * upmixing, on the theory that a wider output frame could clobber an
+         * unread input frame — but both the read and the write use the SAME
+         * `stride`, so frames tile without overlap and each frame's L/R is
+         * read before that same frame is written. Nothing could clobber.
+         * Meanwhile EVERY stage in here is STATEFUL — the EQ biquads, the
+         * parameter glide, the LFE one-poles and the surround delay lines —
+         * so running the block backwards fed them time-reversed audio. A
+         * causal filter driven backwards smears its ringing BEFORE each
+         * transient, which is exactly what "the audio plays backwards"
+         * sounds like. Verified with tools/dsp_reverse_test.c, which caught
+         * the 5.1/7.1 layouts filtering anticausally. */
+        (void)in_ch;
 
         for (f = 0; f < frames; ++f) {
-            uint32_t idx = reverse ? (frames - 1 - f) : f;
-            float *frame = buffer + (size_t)idx * stride;
+            float *frame = buffer + (size_t)f * stride;
             float l, r;
             float preamp, master, bal_l, bal_r;
 
