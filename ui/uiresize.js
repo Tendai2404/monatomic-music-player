@@ -31,10 +31,20 @@ MN.define("uiresize", "1.0.0", [], function () {
     if (!head) return;
     const KEY = "mn.trackcols";
 
-    /* restore persisted widths */
+    /* restore persisted widths — but only when the token count still
+       matches the live column count. The star-rating column's removal
+       (2026-08-24) left old installs with an 8-value list for a 7-column
+       grid; restoring it verbatim would misalign every row. */
     try {
       const saved = localStorage.getItem(KEY);
-      if (saved) root.style.setProperty("--track-cols", saved);
+      if (saved) {
+        const nCols = head.querySelectorAll(".th").length;
+        if (saved.trim().split(/\s+/).length === nCols) {
+          root.style.setProperty("--track-cols", saved);
+        } else {
+          localStorage.removeItem(KEY);
+        }
+      }
     } catch (_) {}
 
     const ths = Array.from(head.querySelectorAll(".th"));

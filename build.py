@@ -61,6 +61,12 @@ SOURCES = [
     os.path.join(SRC, "depth.c"),
     os.path.join(SRC, "modeldl.c"),
     os.path.join(SRC, "sync.c"),
+    # UDP auto-discovery of the phone's sync server (Winsock broadcast).
+    os.path.join(SRC, "discover.c"),
+    # Sync device registry: paired phones/players, persisted + active one.
+    os.path.join(SRC, "devices.c"),
+    # Desktop remote-control listener (phone -> PC transport, token-gated).
+    os.path.join(SRC, "control.c"),
     # Stem export: audio-file writers (WAV/FLAC/MP3) + .mnstem ZIP container.
     os.path.join(SRC, "audio_write.c"),
     os.path.join(SRC, "stempack.c"),
@@ -198,6 +204,9 @@ def build_windows(target, debug):
 
     libs = ["ole32.lib", "oleaut32.lib", "user32.lib", "advapi32.lib", "gdi32.lib",
             "shell32.lib", "shlwapi.lib", "uuid.lib", "winhttp.lib", "dxgi.lib", "dxguid.lib",
+            # Winsock + adapter enumeration (discover.c): UDP broadcast
+            # auto-discovery of the phone's sync server.
+            "ws2_32.lib", "iphlpapi.lib",
             # Media Foundation universal-decode backend (mf_decode.c): AAC/M4A/
             # ALAC/WMA/AC3/AIFF/Opus via IMFSourceReader. Built into Windows.
             "mfplat.lib", "mf.lib", "mfreadwrite.lib", "mfuuid.lib",

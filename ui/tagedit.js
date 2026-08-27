@@ -481,7 +481,6 @@ window.MnTagEdit = (function () {
   /* ============================================================
      ACTIONS shared by the rich context menu
      ============================================================ */
-  function setRating(id, stars) { B.send({ cmd: "rating", id, stars }); }
   function setLiked(id, v)       { B.send({ cmd: "like", id, v }); }
   function reveal(path)          { if (path) B.send({ cmd: "reveal", path }); }
 
@@ -579,7 +578,6 @@ window.MnTagEdit = (function () {
       add("Duration", fmtDur(row.duration_ms));
       add("Size", fmtBytes(row.size));
       add("Play count", row.play_count || 0);
-      add("Rating", (row.rating || 0) + " / 5");
       add("Liked", row.liked === 1 ? "👍" : row.liked === -1 ? "👎" : "—");
       add("Date added", fmtDate(row.date_added));
       const p = el("div", "prop-row prop-path");
@@ -598,12 +596,9 @@ window.MnTagEdit = (function () {
   }
 
   /* ---------- shared menu fragments ---------- */
-  function ratingSub(id) {
+  /* Star ratings removed (2026-08-24) — thumbs are the whole surface. */
+  function likeSub(id) {
     const items = [];
-    for (let n = 5; n >= 1; n--)
-      items.push({ label: "★".repeat(n) + "☆".repeat(5 - n), fn: () => setRating(id, n) });
-    items.push({ label: "No rating", fn: () => setRating(id, 0) });
-    items.push({ sep: true });
     items.push({ label: "👍 Thumbs up", fn: () => setLiked(id, 1) });
     items.push({ label: "👎 Thumbs down", fn: () => setLiked(id, -1) });
     items.push({ label: "Clear thumbs", fn: () => setLiked(id, 0) });
@@ -708,7 +703,7 @@ window.MnTagEdit = (function () {
       { sep: true },
       { icon: "🔀", label: "Play shuffled",   fn: () => { B.send({ cmd: "shuffle", on: true }); B.send({ cmd: "play", id }); } },
       { icon: "🔎", label: "Find more from same", sub: findMoreSub(row) },
-      { icon: "★", label: "My Rating",       sub: ratingSub(id) },
+      { icon: "👍", label: "Like / Dislike",  sub: likeSub(id) },
       { sep: true },
       { icon: "✎", label: "Edit tags…",       fn: () => openTrack(row, rowEl) },
       { icon: "🅰", label: "Tag from filename", fn: () => { openTrack(row, rowEl); setTimeout(fillFromFilename, 60); } },
