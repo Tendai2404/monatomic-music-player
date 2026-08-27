@@ -176,6 +176,22 @@
   };
   const PAGE = 100, APAGE = 60;
 
+  /* ---------- PER-LIBRARY AUDIO PROFILE ----------
+     EQ curve and playback speed are a property of the LIBRARY you are in, not
+     of the session: "more treble on audiobooks, flat in music". The profiles
+     live in localStorage and are pushed to the engine through the ordinary
+     eq/speed commands on every kind switch — the C side stays unaware of
+     kinds. Registered here (not inside the blocks that own the UI) because
+     applyKindLocal runs from a bus reply and must never depend on which
+     init-IIFE has executed yet. */
+  const kindAudio = { eq: null, speed: null };
+  function applyKindAudio(kind) {
+    kind = String(kind || "");
+    if (kindAudio.eq) kindAudio.eq(kind);
+    if (kindAudio.speed) kindAudio.speed(kind);
+    if (kindAudio.eqScope) kindAudio.eqScope();
+  }
+
   /* ============================================================
      ELEMENTS
      ============================================================ */
@@ -3100,9 +3116,14 @@
     if (state.view === "radio")    { applyTitle("Radio"); return; }
     if (state.view === "streams")  { applyTitle("Streams"); return; }
     if (state.view === "podcasts") { applyTitle("Podcasts"); return; }
-    if (state.activeKind && state.view === 1) {
-      const c = state.albTotal || 0;
+    if (state.activeKind && typeof state.view === "number") {
       const lbl = kindLabel(state.activeKind);
+      /* a filtered browse inside a kind must NAME the domain it searched —
+         an unlabelled 'Results for "x"' is what made a kind-scoped result
+         list read as a music result list */
+      if (state.query) { applyTitle('Results for "' + state.query + '" in ' + lbl); return; }
+      if (state.view !== 1) { applyTitle(lbl + "  ·  " + (VIEW_TITLES[state.view] || "Library")); return; }
+      const c = state.albTotal || 0;
       let t2 = c ? lbl + "  ·  " + c.toLocaleString() : lbl;
       const ms = (state.kindStats || {})[state.activeKind] || 0;
       if (ms >= 60000)
@@ -3131,13 +3152,17 @@
     if (v === 1 && motion.get("albumStyle") === "coverflow") coverflowSetActive(true);
     if (state.category === "liked") send({ cmd: "likedonly", on: false });
     state.category = null; state.categoryFilter = null;
-    /* Navigating to a normal LIBRARY view (Tracks/Albums/…) leaves any per-kind
-       library (audiobook/ost/…) → return to music scope + forget the last kind. */
-    if (state.activeKind) { setCategoryMode(""); try { localStorage.removeItem("mn.lastkind"); } catch (_) {} }
+    /* KIND IS STICKY — nothing here may touch state.activeKind. Leaving a
+       per-kind library (audiobook/ost/…) is an EXPLICIT gesture owned by the
+       sidebar .nav-item handler. Resetting it here meant that merely CLOSING
+       THE SEARCH BOX (closeSearch → switchView) switched the whole backend
+       back to music mid-session — the "search in Audiobooks returns music"
+       bug — and that clicking an album-artist threw you into the music
+       library. Changing views inside a kind stays inside that kind. */
     if (typeof updateCatHeader === "function") updateCatHeader();
     try { localStorage.setItem("mn.lastview", String(v)); } catch (_) {}
     if (typeof window.__mnNavPush === "function") window.__mnNavPush();
-    $$(".nav-item").forEach((n) => n.classList.toggle("active", +n.dataset.view === v));
+    syncNavHighlight(v);
     if (typeof syncViewModeSeg === "function") syncViewModeSeg();
 
     /* Folders gets a dedicated panel driven by {"cmd":"folders"} — we do NOT
@@ -3162,6 +3187,13 @@
         resetAlbums(); loadAlbums();
       } else {
         updateViewTitle();
+      }
+      /* Reaching Albums from INSIDE a kind (an artist/album drill-in, or
+         closing the search box) has to look like the kind's own landing
+         view — openKindView is no longer the only way in. */
+      if (state.activeKind && !state._pendingBootKind) {
+        send({ cmd: "kindstats" });
+        if (!state.query) refreshContinueShelf();
       }
     }
     else if (v === 2) { showPanel("view-facet"); openFacet("artists", 1); }
@@ -3433,7 +3465,9 @@
     if (typeof clearCategory === "function") clearCategory(true);
     setLibraryFilter(query);   /* backend filter + album-cache invalidation */
     state.view = 0;
-    $$(".nav-item").forEach((n) => n.classList.toggle("active", n.dataset.view === "0"));
+    /* sibling of navGoAlbums: a filtered browse NEVER leaves the active kind,
+       so the sidebar must keep pointing at the kind, not at Tracks */
+    syncNavHighlight(0);
     send({ cmd: "view", v: 0 });
     showPanel("view-tracks");
     resetTracks(); loadTracks();
@@ -3454,7 +3488,7 @@
       showPanel("view-search");            /* leaves searchOpen alone for this id */
       state.searchOpen = true;
     }
-    E.viewTitle.textContent = 'Results for "' + query + '"';
+    E.viewTitle.textContent = resultsTitle(query);
     /* the results panel is a real history entry (typing evolves the top
        entry in place — see navPush's replace-top rule) */
     if (typeof window.__mnNavPush === "function") window.__mnNavPush();
@@ -4630,6 +4664,27 @@
   E.btnRepeat.addEventListener("click", () => send({ cmd: "repeat" }));
 
   /* ---------- Equalizer / DSP overlay ---------- */
+  const EQ_BANDS_N = 10;               /* MN_DSP_EQ_BANDS */
+  function eqProfKey(kind) { return "mn.eqprof." + String(kind || ""); }
+  /* A kind with no saved profile is FLAT — inheriting the previous library's
+     curve is the whole thing this feature exists to prevent. `dsp: null` means
+     "don't touch the master DSP switch": it also gates balance and the limiter,
+     so a kind that never toggled it must leave it exactly as it found it. */
+  function eqProfFlat() {
+    return { bands: new Array(EQ_BANDS_N).fill(0), preamp: 0, eqon: false, dsp: null };
+  }
+  function eqProfHas(kind) {
+    try { return !!localStorage.getItem(eqProfKey(kind)); } catch (_) { return false; }
+  }
+  function eqProfLoad(kind) {
+    let p = null;
+    try { p = JSON.parse(localStorage.getItem(eqProfKey(kind)) || "null"); } catch (_) {}
+    if (!p || !Array.isArray(p.bands)) return eqProfFlat();
+    const bands = new Array(EQ_BANDS_N).fill(0);
+    for (let i = 0; i < EQ_BANDS_N && i < p.bands.length; i++) bands[i] = +p.bands[i] || 0;
+    return { bands, preamp: +p.preamp || 0, eqon: !!p.eqon,
+             dsp: (p.dsp === true || p.dsp === false) ? p.dsp : null };
+  }
   (function initEq() {
     const overlay = $("#eq-overlay");
     const btnEq = $("#btn-eq");
@@ -4655,6 +4710,7 @@
           const g = parseFloat(sl.value);
           val.textContent = (g > 0 ? "+" : "") + g;
           send({ cmd: "eq", action: "band", band: i, gain: g });
+          eqSaveProfile();
         });
         const lbl = el("div", "eq-band-hz", fmtHz(hz));
         col.appendChild(val); col.appendChild(sl); col.appendChild(lbl);
@@ -4662,6 +4718,25 @@
         sliders.push({ sl, val });
       });
     }
+
+    /* Save the LIVE control state into the active kind's profile. Called from
+       the user's own gestures only — never from an engine reply, or applying
+       one library's profile would overwrite the next one's. */
+    function eqSaveProfile() {
+      /* merge onto the STORED profile, never onto a fresh flat one: the panel
+         may not have built its sliders yet, and zeroing the saved curve from a
+         DSP toggle would silently wipe the library's EQ */
+      const p = eqProfLoad(state.activeKind || "");
+      for (let i = 0; i < EQ_BANDS_N; i++)
+        if (sliders[i]) p.bands[i] = parseFloat(sliders[i].sl.value) || 0;
+      if (preamp) p.preamp = parseFloat(preamp.value) || 0;
+      if (enEq) p.eqon = !!enEq.checked;
+      if (enDsp) p.dsp = !!enDsp.checked;
+      try { localStorage.setItem(eqProfKey(state.activeKind || ""), JSON.stringify(p)); } catch (_) {}
+    }
+    /* Presets (and Reset) are resolved by the ENGINE, so the resulting curve is
+       only known once its reply lands — capture it there, once. */
+    let eqSaveOnReply = false;
 
     on("eq", (m) => {
       if (Array.isArray(m.freqs) && (!built || sliders.length !== m.freqs.length)) {
@@ -4692,9 +4767,45 @@
         if (balVal) balVal.textContent = pct === 0 ? "C" : (pct < 0 ? "L" + (-pct) : "R" + pct);
       }
       if (enLim && m.limiter != null) enLim.checked = !!m.limiter;
+      if (eqSaveOnReply) { eqSaveOnReply = false; eqSaveProfile(); }
     });
 
-    function openEq() { overlay.hidden = false; send({ cmd: "eq", action: "get" }); }
+    /* Push the given library's profile into the engine. Runs on every kind
+       switch, including into music — where the profile is flat, which is what
+       makes an audiobook treble lift stop at the audiobook library. */
+    kindAudio.eq = function (kind) {
+      /* ADOPT, don't clobber, on the very first switch into a library that
+         has no saved profile yet: the engine may already be carrying a curve
+         the user tuned before per-library EQ existed. Flattening it here
+         would silently throw that away. Once adopted it is a real profile
+         and every later switch restores it. */
+      if (!eqProfHas(kind)) { eqSaveOnReply = true; send({ cmd: "eq", action: "get" }); return; }
+      const p = eqProfLoad(kind);
+      for (let i = 0; i < EQ_BANDS_N; i++)
+        send({ cmd: "eq", action: "band", band: i, gain: p.bands[i] });
+      send({ cmd: "eq", action: "preamp", gain: p.preamp });
+      send({ cmd: "eq", action: "eqon", on: p.eqon });
+      if (p.dsp !== null) send({ cmd: "eq", action: "enable", on: p.dsp });
+      /* repaint immediately: an OPEN panel showing the previous library's
+         curve while the engine plays another one is the confusing case */
+      for (let i = 0; i < EQ_BANDS_N; i++) {
+        if (!sliders[i]) continue;
+        sliders[i].sl.value = p.bands[i];
+        sliders[i].val.textContent = (p.bands[i] > 0 ? "+" : "") + p.bands[i];
+      }
+      if (preamp) { preamp.value = p.preamp; preampVal.textContent = (p.preamp > 0 ? "+" : "") + p.preamp + " dB"; }
+      if (enEq) enEq.checked = p.eqon;
+      if (p.dsp !== null && enDsp) enDsp.checked = p.dsp;
+    };
+
+    /* The curve is per library — say which one, so a "why is this flat?"
+       moment after switching libraries answers itself. */
+    function syncEqScope() {
+      const el = $("#eq-scope");
+      if (el) el.textContent = "Applies to: " + kindLabel(state.activeKind || "");
+    }
+    kindAudio.eqScope = syncEqScope;
+    function openEq() { overlay.hidden = false; syncEqScope(); send({ cmd: "eq", action: "get" }); }
     /* graceful out — the panel exits per the overlay channel, then hides */
     function closeEq() { motion.close(overlay, () => { overlay.hidden = true; }); }
     btnEq.addEventListener("click", openEq);
@@ -4702,16 +4813,25 @@
     overlay.addEventListener("click", (e) => { if (e.target === overlay) closeEq(); });
     document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !overlay.hidden) closeEq(); });
 
-    if (enDsp) enDsp.addEventListener("change", () => send({ cmd: "eq", action: "enable", on: enDsp.checked }));
-    if (enEq) enEq.addEventListener("change", () => send({ cmd: "eq", action: "eqon", on: enEq.checked }));
+    if (enDsp) enDsp.addEventListener("change", () => { send({ cmd: "eq", action: "enable", on: enDsp.checked }); eqSaveProfile(); });
+    if (enEq) enEq.addEventListener("change", () => { send({ cmd: "eq", action: "eqon", on: enEq.checked }); eqSaveProfile(); });
+    /* limiter + balance stay GLOBAL: they are output protection / speaker
+       trim, not a per-library taste setting */
     if (enLim) enLim.addEventListener("change", () => send({ cmd: "eq", action: "limiter", on: enLim.checked, threshold: -1, ceiling: -0.1 }));
-    if (selPreset) selPreset.addEventListener("change", () => send({ cmd: "eq", action: "preset", preset: parseInt(selPreset.value, 10) || 0 }));
-    if (preamp) preamp.addEventListener("input", () => { const g = parseFloat(preamp.value); preampVal.textContent = (g > 0 ? "+" : "") + g + " dB"; send({ cmd: "eq", action: "preamp", gain: g }); });
+    if (selPreset) selPreset.addEventListener("change", () => { eqSaveOnReply = true; send({ cmd: "eq", action: "preset", preset: parseInt(selPreset.value, 10) || 0 }); });
+    if (preamp) preamp.addEventListener("input", () => { const g = parseFloat(preamp.value); preampVal.textContent = (g > 0 ? "+" : "") + g + " dB"; send({ cmd: "eq", action: "preamp", gain: g }); eqSaveProfile(); });
     if (bal) bal.addEventListener("input", () => { const v = parseInt(bal.value, 10) / 100; balVal.textContent = v === 0 ? "C" : (v < 0 ? "L" + Math.round(-v * 100) : "R" + Math.round(v * 100)); send({ cmd: "eq", action: "balance", v }); });
     const btnReset = $("#eq-reset");
-    if (btnReset) btnReset.addEventListener("click", () => { send({ cmd: "eq", action: "preset", preset: 0 }); });
+    if (btnReset) btnReset.addEventListener("click", () => { eqSaveOnReply = true; send({ cmd: "eq", action: "preset", preset: 0 }); });
     /* auto-enable DSP the first time the user opens the EQ so changes are audible */
-    btnEq.addEventListener("click", () => { if (enDsp && !enDsp.checked) { enDsp.checked = true; send({ cmd: "eq", action: "enable", on: true }); } }, { once: true });
+    btnEq.addEventListener("click", () => {
+      if (!enDsp || enDsp.checked) return;
+      enDsp.checked = true;
+      send({ cmd: "eq", action: "enable", on: true });
+      /* the sliders do not exist yet on this very first open — let the reply
+         that builds them be what writes the profile */
+      eqSaveOnReply = true;
+    }, { once: true });
   })();
 
   /* ---------- spectrum visualizer (32-bar FFT from the C engine) ---------- */
@@ -4842,12 +4962,36 @@
       btn.title = v === 1 ? "Playback speed (pitch-preserved)"
                           : "Playing at " + label(v) + " — pitch preserved";
     }
+    /* Speed is PER LIBRARY. It used to be one global "mn.speed" re-sent at
+       boot with no kind check — and #btn-speed is CSS-hidden in music, so a
+       2× left over from a book was unreachable there while it time-stretched
+       every song. Music is therefore pinned to 1.0, not merely defaulted. */
+    function speedKey(kind) { return "mn.speed." + String(kind || ""); }
+    function speedFor(kind) {
+      if (!kind) return 1;
+      let v = 1;
+      try { v = parseFloat(localStorage.getItem(speedKey(kind))) || 1; } catch (_) {}
+      return (v < 0.5 || v > 3) ? 1 : v;
+    }
+    /* one-time carry-over of the old global setting into the library it was
+       actually used in */
+    try {
+      const legacy = localStorage.getItem("mn.speed");
+      if (legacy !== null) {
+        if (localStorage.getItem(speedKey("audiobook")) === null)
+          localStorage.setItem(speedKey("audiobook"), legacy);
+        localStorage.removeItem("mn.speed");
+      }
+    } catch (_) {}
+
     let cur = 1;
-    try { cur = parseFloat(localStorage.getItem("mn.speed")) || 1; } catch (_) {}
-    if (cur < 0.5 || cur > 3) cur = 1;
+    try { cur = speedFor(localStorage.getItem("mn.lastkind") || ""); } catch (_) {}
     applyUI(cur);
-    /* re-apply the persisted speed once the engine is up (boot) */
-    if (cur !== 1) setTimeout(() => send({ cmd: "speed", v: cur }), 1500);
+    kindAudio.speed = function (kind) {
+      cur = speedFor(kind);
+      applyUI(cur);
+      send({ cmd: "speed", v: cur });
+    };
     on("speed", (m) => {
       if (m && typeof m.v === "number") { cur = m.v; applyUI(cur); }
     });
@@ -4861,7 +5005,7 @@
       SPEEDS.forEach((v) => {
         const it = el("div", "pl-picker-item" + (v === cur ? " on" : ""), label(v));
         it.addEventListener("click", () => {
-          try { localStorage.setItem("mn.speed", String(v)); } catch (_) {}
+          try { localStorage.setItem(speedKey(state.activeKind || ""), String(v)); } catch (_) {}
           send({ cmd: "speed", v: v });
           dismiss();
         });
@@ -7150,6 +7294,11 @@
     getPos: currentPos,
     /* Drive the search box + view from code ("Find more from same…"). */
     setSearch: (q) => runSearch(q),
+    /* ENTITY navigation for modules' context menus. These go through the
+       kind-preserving helpers, so "same artist" from inside Audiobooks
+       lands on that author's BOOKS instead of dumping you into music. */
+    goArtist: (name) => navGoAlbums(name),
+    goAlbum: (title, artist) => navGoAlbum(title, artist || ""),
     /* Media-tool scope data (unified roots + DB folder dimension). */
     getRoots: () => (state.roots || []),
     getFolders: () => (state.folders || []),
@@ -7184,23 +7333,82 @@
     if (kind === "audiobook") return "Audiobooks";
     return kind ? kind.charAt(0).toUpperCase() + kind.slice(1) : "Library";
   }
-  function setCategoryMode(kind) {
+  /* sidebar key for a kind: audiobooks has a permanent entry, customs are
+     generated as "kind:<k>" */
+  function navKeyForKind(kind) {
+    return kind === "audiobook" ? "audiobooks" : "kind:" + kind;
+  }
+  /* Inside a kind the sidebar must keep pointing at the KIND however you got
+     to the current view — a numeric match would light up "Albums" (or nothing
+     at all) and make a drill-in look like it had left the library. */
+  function syncNavHighlight(v) {
+    const kk = state.activeKind ? navKeyForKind(state.activeKind) : null;
+    $$(".nav-item").forEach((n) => n.classList.toggle("active",
+      kk ? n.dataset.view === kk : +n.dataset.view === v));
+  }
+  /* the search box must SAY which library it is about to search — a scoped
+     search that looks unscoped reads as a broken search */
+  function syncSearchScope() {
+    if (!E.search) return;
+    E.search.placeholder = state.activeKind
+      ? "Search " + kindLabel(state.activeKind) + "…"
+      : "Search tracks, artists, albums…";
+  }
+  function resultsTitle(q) {
+    return 'Results for "' + q + '"' +
+           (state.activeKind ? " in " + kindLabel(state.activeKind) : "");
+  }
+
+  /* applyKindLocal is the NON-SENDING half of setCategoryMode: everything the
+     UI has to mirror when the active kind changes, with no `category` command
+     emitted. C is authoritative about the active kind, so its {"type":
+     "category"} broadcast comes back through here — routing that through
+     setCategoryMode would ping-pong C→UI→C forever. Returns true when the
+     kind actually changed. */
+  function applyKindLocal(kind) {
     kind = String(kind || "");
+    /* Mode classes FIRST (even when kind unchanged — the early return below
+       must never leave the chrome out of sync with the library).
+       kind-mode      = SOME non-music library is active (generic chrome).
+       kind-audiobook = specifically the audiobook library. The ±30s skip,
+       bookmark, speed and Continue shelf are book affordances, so they gate
+       on the narrower class: a custom kind like "ost" or "video game music"
+       is still music and must not sprout book controls. */
+    document.body.classList.toggle("kind-mode", !!kind);
+    document.body.classList.toggle("kind-audiobook", kind === "audiobook");
     /* persist so launch can return you to the SAME library (e.g. Audiobooks)
        instead of always dropping into music */
     try { localStorage.setItem("mn.lastkind", kind); } catch (_) {}
-    /* book-mode class FIRST (even when kind unchanged): every audiobook-only
-       control — Continue shelf, ±30s skip, bookmark, speed — is CSS-gated on
-       body.kind-mode so none of it can appear in the music library */
-    document.body.classList.toggle("kind-mode", !!kind);
-    if ((state.activeKind || "") === kind) return;
+    if ((state.activeKind || "") === kind) { syncSearchScope(); return false; }
     state.activeKind = kind;
     state.abMode = kind === "audiobook";        /* legacy readers */
-    send({ cmd: "category", kind: kind });
     state.albDirty = true;     /* every library re-queries on next view */
     /* the Continue shelf belongs to kind views only — hide on music */
     if (!kind && typeof hideContinueShelf === "function") hideContinueShelf();
+    syncSearchScope();
+    syncNavHighlight(state.view);
+    updateViewTitle();
+    /* per-library EQ + speed: the treble curve you set for audiobooks must
+       not follow you into music (and vice versa) */
+    applyKindAudio(kind);
+    return true;
   }
+  function setCategoryMode(kind) {
+    kind = String(kind || "");
+    if (!applyKindLocal(kind)) return;
+    send({ cmd: "category", kind: kind });
+  }
+  /* C told us which library is active (boot handshake or a change it made on
+     its own) — adopt it and re-fetch, since the loaded page belongs to the
+     library we were in a moment ago. When WE caused the change applyKindLocal
+     returns false and this is a no-op, which is the echo guard. */
+  function syncKindFromC(kind) {
+    if (!applyKindLocal(kind)) return;
+    if (state.view === 1) { state.albDirty = false; resetAlbums(); loadAlbums(); }
+    else if (typeof state.view === "number") { resetTracks(); loadTracks(); }
+    if (state.activeKind) { send({ cmd: "kindstats" }); refreshContinueShelf(); }
+  }
+  on("category", (m) => { if (m) syncKindFromC(String(m.kind || "")); });
   /* Open any per-kind library (audiobook or a custom designation like
      "ost") — books/albums render through the virtual albums grid. */
   function openKindView(kind, navKey) {
@@ -7245,6 +7453,12 @@
     /* refresh any open folders view so its selectors show fresh options */
     if (typeof renderFolders === "function" && state.folders.length) renderFolders();
 
+    /* C reports the session's active kind here — adopt it BEFORE the boot
+       restore below, which is the one case where the UI legitimately leads
+       (C is still on music until openKindView sends the category). */
+    if (typeof m.active === "string" && !state._pendingBootKind)
+      syncKindFromC(m.active);
+
     /* One-shot boot restore: return to the per-kind library the user was in
        last session (e.g. Audiobooks), now that we know which kinds exist.
        "audiobook" is always valid (built-in section); customs must be present. */
@@ -7265,8 +7479,17 @@
     if (dv === "radio")    { openOnlineView("radio");    return; }
     if (dv === "streams")  { openOnlineView("streams");  return; }
     if (dv === "podcasts") { openOnlineView("podcasts"); return; }
+    /* Custom designations ("ost", "video game music") are generated later with
+       their OWN click handler, so they never reach this delegator — but a
+       static markup entry would, and dropping it into the music branch below
+       is exactly the kind-destroying bug this file was fixed for. */
+    if (dv && dv.indexOf("kind:") === 0) { openKindView(dv.slice(5), dv); return; }
     navClearSearchContext();   /* sidebar = fresh, unfiltered view */
-    setCategoryMode("");       /* any other destination is the MUSIC library */
+    /* THE ONE EXPLICIT EXIT from a per-kind library: clicking a Library-group
+       destination means "the music library", so the kind is dropped here and
+       nowhere else (switchView must never do it — see the note there). */
+    setCategoryMode("");
+    try { localStorage.removeItem("mn.lastkind"); } catch (_) {}
     if (dv === "models") { openModelsView(); return; }
     if (dv === "lyrics") { openLyricsView(); return; }
     if (dv === "mediatool") { openMediaToolView(); return; }
@@ -7837,6 +8060,11 @@
        not change unless told to. This is the fix for the stuck library. */
     const wantFilter = snap.query || "";
     setLibraryFilter(wantFilter);
+    /* the per-kind library is part of the LOCATION — restore it for a results
+       entry too, otherwise stepping back into a search made inside Audiobooks
+       re-ran it against whatever library happens to be active now */
+    const wantKind = snap.kind || "";
+    if (wantKind !== (state.activeKind || "")) setCategoryMode(wantKind);
     if (snap.searchOpen) {
       /* the RESULTS PANEL is a real history entry — restore it live */
       if (E.search) E.search.value = snap.searchQ || "";
@@ -7844,13 +8072,11 @@
       saGen++; saLastQ = snap.searchQ || "";
       send({ cmd: "searchall", q: saLastQ, gen: saGen });
       showPanel("view-search");
-      E.viewTitle.textContent = 'Results for "' + saLastQ + '"';
+      E.viewTitle.textContent = resultsTitle(saLastQ);
     } else {
       if (E.search) E.search.value = wantFilter;
       state.searchOpen = false;
-      const wantKind = snap.kind || "";
-      if (wantKind !== (state.activeKind || "")) setCategoryMode(wantKind);
-      if (wantKind && typeof window.__mnOpenKind === "function")
+      if (wantKind && !wantFilter && typeof window.__mnOpenKind === "function")
         window.__mnOpenKind(wantKind, wantKind === "audiobook" ? "audiobooks" : "kind:" + wantKind);
       else if (snap.category) { if (typeof openCategory === "function") openCategory(snap.category); }
       else switchView(snap.view);
@@ -7972,6 +8198,11 @@
   send({ cmd: "folders" });   /* hidden-folder banner state (graceful if unanswered) */
   send({ cmd: "kinds" });     /* sidebar sections for custom folder designations */
   send({ cmd: "eq", action: "get" });   /* seed the bit-perfect verdict's DSP state */
+  /* Boot lands in a library too, so its audio profile has to be applied like
+     any other kind switch — otherwise the engine keeps LAST session's curve
+     and speed, which is exactly the leak per-library profiles exist to stop.
+     Delayed past the `kinds` reply so a restored kind view wins. */
+  setTimeout(() => applyKindAudio(state.activeKind || ""), 1900);
 
   /* Optional startup rescan (Settings → Interface): incremental, a few
      seconds after launch so boot stays snappy — unchanged files skip in

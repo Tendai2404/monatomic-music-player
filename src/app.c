@@ -657,6 +657,17 @@ void mn_app_set_category_kind(mn_app *app, const char *kind)
     MN_UNLOCK(&app->lib_lock);
 }
 
+bool mn_app_get_category_kind(mn_app *app, char *out, size_t n)
+{
+    if (!out || n == 0) return false;
+    out[0] = '\0';
+    if (!app) return false;
+    MN_LOCK(&app->lib_lock);
+    mn_copy_str(out, n, app->active_kind);
+    MN_UNLOCK(&app->lib_lock);
+    return true;
+}
+
 void mn_app_set_kind_roots(mn_app *app, const char kinds[][32],
                            const char paths[][512], int n)
 {
@@ -4625,9 +4636,10 @@ void mn_app_play_album_track(mn_app *app, int64_t album_id, int64_t track_id)
     MN_UNLOCK(&app->lib_lock);
 }
 
-/* Build a heap array of mn_track for a whole album (by id) or a single track
- * (by id). Caller frees *out_tracks. Returns the count (0 on miss/empty).
- * Must be called with the lib_lock held. */
+/* Build a heap array of mn_track for a whole album (album_id > 0) or a single
+ * track (album_id <= 0, by track_id). Caller frees *out_tracks. Returns the
+ * count (0 on miss/empty). Must be called with the lib_lock held, and the
+ * caller must still hold it when it consumes the rows. */
 static size_t mn_app_gather_tracks_locked(mn_app *app, int64_t track_id,
                                           int64_t album_id,
                                           mn_track **out_tracks)
@@ -4635,22 +4647,55 @@ static size_t mn_app_gather_tracks_locked(mn_app *app, int64_t track_id,
     mn_filter_spec      spec;
     mn_query           *q = NULL;
     const mn_track_row *db_rows = NULL;
-    int32_t             got = 0;
+    int32_t             got = 0, i;
     mn_track           *arr = NULL;
-    size_t              n = 0;
+    char               *blob = NULL;
+    size_t              n = 0, bytes = 0;
 
     *out_tracks = NULL;
 
-    memset(&spec, 0, sizeof(spec));
-    if (album_id > 0) {
-        spec.cascade[0].dim = MN_FACET_ALBUM;
-        spec.cascade[0].value_id = album_id;
-        spec.cascade_len = 1;
-        spec.sort[0].key = MNDB_SORT_TRACK;
-        spec.sort[0].descending = false;
-        spec.sort_len = 1;
+    /* Single explicit track: resolve it by id instead of hunting for it in a
+     * windowed browse query. The old shape opened an UNCASCADED query and
+     * linear-scanned the first MN_QUEUE_BUILD_MAX rows, so a track sorted past
+     * that cap was unreachable — and dropping the kind stamp below widens that
+     * row set across every library, which would make the miss MORE likely.
+     * The id came from the UI, so it is authoritative on its own. */
+    if (album_id <= 0) {
+        char    path[MN_STR_PATH];
+        int64_t dur = 0;
+        size_t  plen;
+        if (track_id <= 0) return 0;
+        if (!mn_library_track_path_duration(app->lib, track_id, path,
+                                            sizeof(path), &dur))
+            return 0;
+        plen = strlen(path) + 1;
+        blob = (char *)calloc(1, sizeof(mn_track) + plen);
+        if (!blob) return 0;
+        arr = (mn_track *)blob;
+        memcpy(blob + sizeof(mn_track), path, plen);
+        arr[0].path        = blob + sizeof(mn_track);
+        arr[0].id          = track_id;
+        arr[0].rg_track_db = MN_RG_UNKNOWN_DB;
+        arr[0].rg_album_db = MN_RG_UNKNOWN_DB;
+        arr[0].duration_ms = dur;
+        *out_tracks = arr;
+        return 1;
     }
-    mn_spec_apply_hidden(app, &spec);
+
+    memset(&spec, 0, sizeof(spec));
+    spec.cascade[0].dim = MN_FACET_ALBUM;
+    spec.cascade[0].value_id = album_id;
+    spec.cascade_len = 1;
+    spec.sort[0].key = MNDB_SORT_TRACK;
+    spec.sort[0].descending = false;
+    spec.sort_len = 1;
+    /* Hidden-only, NOT the kind-scoped stamp — same reasoning as
+     * mn_app_play_album: an EXPLICIT id-addressed action must work across
+     * kinds. With the category filter here, "queue next/last" on an album or
+     * track resolved outside the active kind (a cross-kind search hit, the
+     * right panel after an album-artist jump) built a query the kind scope
+     * emptied, so gather returned 0 rows and the command silently no-op'd. */
+    mn_spec_apply_hidden_only(app, &spec);
 
     if (mn_query_open(app->lib, &spec, &q) != MNDB_OK || !q)
         return 0;
@@ -4660,22 +4705,35 @@ static size_t mn_app_gather_tracks_locked(mn_app *app, int64_t track_id,
         return 0;
     }
 
-    arr = (mn_track *)calloc((size_t)got, sizeof(mn_track));
-    if (!arr) { mn_query_close(q); return 0; }
+    /* The row paths live in the QUERY'S ARENA, which mn_query_close frees —
+     * but the caller consumes the array after this function returns, so the
+     * mn_track array and its path bytes are packed into ONE allocation that
+     * outlives the query. The old code handed back arena pointers and then
+     * closed the query, so playback strdup'd from freed memory. Single block
+     * keeps the caller's plain free(*out_tracks) contract intact. */
+    for (i = 0; i < got; ++i)
+        bytes += db_rows[i].path ? strlen(db_rows[i].path) + 1 : 1;
+    blob = (char *)calloc(1, (size_t)got * sizeof(mn_track) + bytes);
+    if (!blob) { mn_query_close(q); return 0; }
+    arr = (mn_track *)blob;
 
-    for (int32_t i = 0; i < got; ++i) {
-        if (album_id > 0 || db_rows[i].id == track_id) {
-            arr[n].path        = db_rows[i].path;   /* deep-copied by playback */
+    {
+        char *pw = blob + (size_t)got * sizeof(mn_track);
+        for (i = 0; i < got; ++i) {
+            const char *src = db_rows[i].path ? db_rows[i].path : "";
+            size_t      len = strlen(src) + 1;
+            memcpy(pw, src, len);
+            arr[n].path        = pw;
             arr[n].id          = db_rows[i].id;
             arr[n].rg_track_db = MN_RG_UNKNOWN_DB;
             arr[n].rg_album_db = MN_RG_UNKNOWN_DB;
             arr[n].duration_ms = db_rows[i].duration_ms;
+            pw += len;
             n++;
-            if (album_id <= 0) break;   /* single-track match found */
         }
     }
     mn_query_close(q);
-    if (n == 0) { free(arr); return 0; }
+    if (n == 0) { free(blob); return 0; }
     *out_tracks = arr;
     return n;
 }

@@ -367,7 +367,7 @@
         <button id="btn-ab" class="tbtn tbtn-ab" title="A-B repeat — set point A">A·B</button>
         <button id="btn-eq" class="tbtn" title="Equalizer &amp; effects">🎚</button>
         <button id="btn-sleep" class="tbtn" title="Sleep timer">🌙</button>
-        <button id="btn-speed" class="tbtn tbtn-speed" title="Playback speed (pitch-preserved)">1×</button>
+        <button id="btn-speed" class="tbtn tbtn-speed" title="Playback speed (pitch-preserved) · remembered per library">1×</button>
         <button id="btn-bookmark" class="tbtn" title="Bookmark this position">🔖</button>
         <button id="btn-stemexport" class="tbtn" title="Export stems of this track">⑂</button>
         <span class="tsep"></span>
@@ -1070,7 +1070,14 @@
 <div id="eq-overlay" class="eq-overlay" hidden>
   <div class="eq-panel">
     <div class="eq-head">
-      <h2>Equalizer &amp; Audio Effects</h2>
+      <div class="eq-head-t">
+        <h2>Equalizer &amp; Audio Effects</h2>
+        <!-- The curve is stored PER LIBRARY KIND (treble-lifted audiobooks vs
+             flat music), so the panel has to name the library it is editing or
+             the user cannot tell why the sliders moved on their own. app.js
+             owns the text; empty means "not yet resolved" and collapses. -->
+        <div id="eq-scope" class="eq-scope"></div>
+      </div>
       <button id="eq-close" class="eq-close" title="Close (Esc)">✕</button>
     </div>
     <div class="eq-row eq-top">

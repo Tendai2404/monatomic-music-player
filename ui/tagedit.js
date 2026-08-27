@@ -485,10 +485,25 @@ window.MnTagEdit = (function () {
   function setLiked(id, v)       { B.send({ cmd: "like", id, v }); }
   function reveal(path)          { if (path) B.send({ cmd: "reveal", path }); }
 
-  /* "Find more from same": drive the app search box. Genre/year search on the
-     literal term; the C-side FTS matches across fields. */
+  /* "Find more from same": every route goes through an app.js navigation
+     helper, never a raw cmd:"search"/"view"/"category". app.js is what keeps
+     the ACTIVE LIBRARY KIND alive across the jump, so a menu that sent its own
+     commands would silently drop the user from Audiobooks into music.
+     Artist and album have entity-aware destinations (the same ones the
+     right-panel meta links use); genre and year have none, so they fall back
+     to the search box and let the C-side FTS match across fields.
+     The helpers are probed rather than assumed so the menu still works against
+     an app.js build that predates the entity-aware bridge. */
   function findMore(term) {
     if (B.setSearch) B.setSearch(term == null ? "" : String(term));
+  }
+  function findMoreArtist(name) {
+    if (B.goArtist) B.goArtist(String(name));
+    else findMore(name);
+  }
+  function findMoreAlbum(title, artist) {
+    if (B.goAlbum) B.goAlbum(String(title), String(artist || ""));
+    else findMore(title);
   }
 
   /* ---------- Properties modal (read-only metadata) ---------- */
@@ -596,8 +611,11 @@ window.MnTagEdit = (function () {
   }
   function findMoreSub(row) {
     const sub = [];
-    if (row.artist)        sub.push({ label: "Same artist",  fn: () => findMore(row.artist) });
-    if (row.album || row.title) sub.push({ label: "Same album",   fn: () => findMore(row.album || row.title) });
+    if (row.artist)        sub.push({ label: "Same artist",  fn: () => findMoreArtist(row.artist) });
+    /* a row with no album (loose file) has no album to open — only the old
+       title-as-query search can say anything about it */
+    if (row.album)         sub.push({ label: "Same album",   fn: () => findMoreAlbum(row.album, row.artist) });
+    else if (row.title)    sub.push({ label: "Same album",   fn: () => findMore(row.title) });
     if (row.genre)         sub.push({ label: "Same genre",   fn: () => findMore(row.genre) });
     if (row.year)          sub.push({ label: "Same year",    fn: () => findMore(String(row.year)) });
     if (!sub.length) sub.push({ label: "(no metadata)", fn: () => {} });

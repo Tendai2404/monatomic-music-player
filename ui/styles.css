@@ -1844,7 +1844,14 @@ span.meta-link:hover{color:var(--accent)}
 .eq-panel{width:min(760px,92vw);background:var(--panel);border:1px solid var(--line-strong);
   border-radius:16px;padding:22px 24px;box-shadow:0 24px 80px rgba(0,0,0,.55)}
 .eq-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
+.eq-head-t{display:flex;flex-direction:column;gap:3px;min-width:0}
 .eq-head h2{font-size:17px;font-weight:700;letter-spacing:.01em}
+/* scope line: same dimmed label voice as .eq-lbl so it reads as panel chrome,
+   not as content. Collapsed while empty so the header keeps its exact former
+   height until app.js has a library name to put here. */
+.eq-scope{font-size:11px;color:var(--text-dim);text-transform:uppercase;
+  letter-spacing:.06em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.eq-scope:empty{display:none}
 .eq-close{width:34px;height:34px;border-radius:50%;display:grid;place-items:center;
   color:var(--text-dim);background:var(--raised);border:1px solid var(--line);
   transition:background var(--t),color var(--t)}
@@ -3103,12 +3110,18 @@ html.no-anim .mo-reveal{opacity:1;transform:none}
 #mo-granular .mo-hint{font-size:10.5px;color:var(--text-dim);opacity:.75;
   margin:-4px 0 6px;line-height:1.35}
 
-/* ==== AUDIOBOOK-MODE EXCLUSIVITY: book UI never appears in music ==== */
-body:not(.kind-mode) #btn-back30,
-body:not(.kind-mode) #btn-fwd30,
-body:not(.kind-mode) #btn-bookmark,
-body:not(.kind-mode) #btn-speed{display:none}
-body:not(.kind-mode) #continue-shelf{display:none!important}
+/* ==== AUDIOBOOK-MODE EXCLUSIVITY: book UI never appears in music ====
+   Gated on .kind-audiobook, NOT the generic .kind-mode: .kind-mode means
+   merely "some non-music library is active", which is also true of a
+   user-designated kind like "ost" or "video game music" — those are music
+   libraries and must not sprout ±30 s skip, bookmarks, a speed control or the
+   Continue-reading shelf. .kind-mode stays for chrome that is generic to every
+   non-music library. */
+body:not(.kind-audiobook) #btn-back30,
+body:not(.kind-audiobook) #btn-fwd30,
+body:not(.kind-audiobook) #btn-bookmark,
+body:not(.kind-audiobook) #btn-speed{display:none}
+body:not(.kind-audiobook) #continue-shelf{display:none!important}
 
 /* ==== MOTION v2.1 — complex/modern wave ==== */
 

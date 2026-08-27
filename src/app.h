@@ -493,6 +493,14 @@ int32_t mn_app_tracks_under(mn_app *app, const char *prefix, int64_t offset,
  * surface to ONLY roots of that kind. */
 void mn_app_set_category_kind(mn_app *app, const char *kind);
 
+/* Read back the kind that is ACTUALLY active. C is the authority: a request
+ * can be coerced (an alias folded to ""), and mn_app_set_kind_roots below can
+ * drop the active kind on its own when the kind's last root disappears — so
+ * the host must never assume the kind it last asked for is the kind in force.
+ * Writes at most `n` bytes (always NUL-terminated when n > 0). Returns false
+ * only on a bad argument. */
+bool mn_app_get_category_kind(mn_app *app, char *out, size_t n);
+
 /* Push every non-music root with its kind label (from the host's
  * folder_kinds registry). Roots are path prefixes; max MN_MAX_KIND_ROOTS. */
 void mn_app_set_kind_roots(mn_app *app, const char kinds[][32],

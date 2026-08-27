@@ -3041,13 +3041,35 @@ static void dispatch_command(cef_frame_t *frame, const char *json) {
         }
     } else if (strcmp(cmd, "category") == 0) {
         /* Per-kind library switch: {"kind":""|"audiobook"|"ost"|...}.
-         * Back-compat: {"ab":true} means kind "audiobook". */
-        char kind[32] = {0};
-        if (!json_get_str(json, "kind", kind, sizeof(kind)) || !kind[0]) {
+         * Back-compat: {"ab":true} means kind "audiobook".
+         * With NEITHER key it is a REPORT: read the kind back without
+         * changing it, so the UI can resync after a navigation instead of
+         * guessing (and instead of asserting a kind, which is how ordinary
+         * navigation used to reset the whole backend to music).
+         * The reply always echoes the kind C actually holds, never the
+         * requested one — kind_is_music() coerces aliases, and the roots
+         * registry can drop a kind out from under the request. */
+        char kind[32] = {0}, eff[32] = {0};
+        bool want_set = false;
+        if (json_find_value(json, "kind") != NULL) {
+            (void)json_get_str(json, "kind", kind, sizeof(kind));
+            want_set = true;
+        } else if (json_find_value(json, "ab") != NULL) {
             if (json_get_bool(json, "ab", false))
                 snprintf(kind, sizeof(kind), "audiobook");
+            want_set = true;
         }
-        mn_app_set_category_kind(g_app, kind_is_music(kind) ? "" : kind);
+        if (want_set)
+            mn_app_set_category_kind(g_app, kind_is_music(kind) ? "" : kind);
+        (void)mn_app_get_category_kind(g_app, eff, sizeof(eff));
+        {
+            strbuf b; sb_init(&b);
+            sb_puts(&b, "{\"type\":\"category\",\"kind\":");
+            sb_json_str(&b, eff);
+            sb_putc(&b, '}');
+            if (!b.oom) emit_to_frame(frame, b.data);
+            sb_free(&b);
+        }
     } else if (strcmp(cmd, "kinds") == 0) {
         strbuf b; sb_init(&b);
         build_kinds(&b);
@@ -3368,6 +3390,18 @@ static void dispatch_command(cef_frame_t *frame, const char *json) {
         char path[1024];
         if (json_get_str(json, "path", path, sizeof(path)) && path[0]) {
             roots_file_touch(path, NULL, true);
+            /* The in-memory kind registry is derived from folder_kinds.txt and
+             * does NOT reload itself. Without these two, removing a root left
+             * the app still excluding it from music (content invisible) or
+             * still counting it toward a kind that no longer owns any folder —
+             * the registry and the file silently diverged. Mirrors removetree. */
+            sync_audiobook_roots();
+            {
+                strbuf b; sb_init(&b);
+                build_kinds(&b);
+                if (!b.oom) emit_to_frame(frame, b.data);
+                sb_free(&b);
+            }
         }
         frame->base.add_ref(&frame->base);
         roots_start(frame);              /* reply with the fresh list */
@@ -6420,13 +6454,24 @@ static void hash_backfill_kick(void) {
     else InterlockedExchange(&g_hashfill_busy, 0);
 }
 
+/* Returns the number of roots read, or NE_ROOTS_UNREADABLE (< 0) when the
+ * registry file EXISTS but could not be opened (sharing violation mid-rewrite,
+ * ACL, transient IO). Callers MUST NOT treat that as "zero roots": doing so
+ * pushed an empty kind registry into the app, which both reset the active kind
+ * and stripped music's exclusion clause so every audiobook/OST track leaked
+ * into the music library. A genuinely absent file is still a plain 0. */
+#define NE_ROOTS_UNREADABLE (-1)
+
 static int roots_file_read(ne_root_line *out, int max) {
     char  kfile[1400], line[1400];
     FILE *kf;
     int   n = 0;
     roots_file_path(kfile, sizeof(kfile));
     kf = fopen(kfile, "r");
-    if (!kf) return 0;
+    if (!kf) {
+        return (GetFileAttributesA(kfile) == INVALID_FILE_ATTRIBUTES)
+             ? 0 : NE_ROOTS_UNREADABLE;
+    }
     while (n < max && fgets(line, sizeof(line), kf)) {
         char *s1 = strchr(line, '|');
         char *s2 = s1 ? strchr(s1 + 1, '|') : NULL;
@@ -6475,8 +6520,16 @@ static void sync_audiobook_roots(void) {
     char kinds[NE_MAX_ROOTS][32];
     char paths[NE_MAX_ROOTS][512];     /* app clamps to MN_MAX_KIND_ROOTS */
     int  n, i, na = 0;
+    char before[32] = {0}, after[32] = {0};
     if (!g_app) return;
     n = roots_file_read(rf, NE_MAX_ROOTS);
+    /* Keep the last-known-good registry rather than pushing an empty one: an
+     * empty registry silently reclassifies every named-kind root as music. */
+    if (n < 0) {
+        fprintf(stderr, "[kinds] roots file unreadable - keeping registry\n");
+        return;
+    }
+    (void)mn_app_get_category_kind(g_app, before, sizeof(before));
     for (i = 0; i < n && na < NE_MAX_ROOTS; i++) {
         if (kind_is_music(rf[i].kind)) continue;
         /* normalize legacy plural */
@@ -6488,16 +6541,37 @@ static void sync_audiobook_roots(void) {
         na++;
     }
     mn_app_set_kind_roots(g_app, kinds, paths, na);
+    /* mn_app_set_kind_roots drops the active kind on its own when that kind's
+     * last root just disappeared. The UI would otherwise keep rendering (and
+     * re-asserting) a kind the backend no longer serves, so make the coercion
+     * observable — C is the authority on the active kind. */
+    (void)mn_app_get_category_kind(g_app, after, sizeof(after));
+    if (_stricmp(before, after) != 0) {
+        cef_frame_t *fr = sync_grab_frame();
+        if (fr) {
+            strbuf b; sb_init(&b);
+            sb_puts(&b, "{\"type\":\"category\",\"kind\":");
+            sb_json_str(&b, after);
+            sb_putc(&b, '}');
+            if (!b.oom) post_emit_owned(fr, b.data);   /* consumes ref + string */
+            else { sb_free(&b); fr->base.release(&fr->base); }
+        }
+    }
 }
 
-/* {"type":"kinds","kinds":[{"kind":"audiobook","roots":2},...]} — the
- * distinct non-music designations, for the sidebar's library sections. */
+/* {"type":"kinds","active":"<kind>","kinds":[{"kind":"audiobook","roots":2},...]}
+ * — the distinct non-music designations, for the sidebar's library sections.
+ * "active" carries the kind actually in force so a booting UI gets the
+ * authoritative selection in the same round trip ("" = the music library). */
 static void build_kinds(strbuf *b) {
     static ne_root_line rf[NE_MAX_ROOTS];
     char seen[NE_MAX_ROOTS][32];
+    char active[32] = {0};
     int  cnt[NE_MAX_ROOTS];
     int  n, i, k, ns = 0;
     n = roots_file_read(rf, NE_MAX_ROOTS);
+    if (n < 0) n = 0;   /* unreadable registry: list nothing, never index rf[-1] */
+    (void)mn_app_get_category_kind(g_app, active, sizeof(active));
     for (i = 0; i < n; i++) {
         const char *kd = rf[i].kind;
         if (kind_is_music(kd)) continue;
@@ -6510,7 +6584,9 @@ static void build_kinds(strbuf *b) {
         }
         if (k < ns) cnt[k]++;
     }
-    sb_puts(b, "{\"type\":\"kinds\",\"kinds\":[");
+    sb_puts(b, "{\"type\":\"kinds\",\"active\":");
+    sb_json_str(b, active);
+    sb_puts(b, ",\"kinds\":[");
     for (k = 0; k < ns; k++) {
         if (k) sb_putc(b, ',');
         sb_puts(b, "{\"kind\":"); sb_json_str(b, seen[k]);
@@ -6527,6 +6603,7 @@ static void kind_for_path(const char *path, char *out, size_t cap) {
     size_t best = 0;
     snprintf(out, cap, "music");
     n = roots_file_read(rf, NE_MAX_ROOTS);
+    if (n < 0) n = 0;   /* unreadable: fall back to "music" as before */
     for (i = 0; i < n; i++) {
         size_t rl = strlen(rf[i].path);
         char  sep;
@@ -6572,6 +6649,11 @@ static void roots_file_touch(const char *path, const char *kind, bool remove) {
     int n = roots_file_read(roots, NE_MAX_ROOTS);
     long long now = (long long)time(NULL);
     int i, found = 0;
+    /* Refuse to rewrite a registry we could not read: `roots` holds garbage and
+     * the write below is a full replace, so proceeding would erase every root
+     * (and the append branch would index roots[-1]). Losing this one stamp is
+     * strictly better than losing the user's library layout. */
+    if (n < 0) return;
     if (!path) {
         for (i = 0; i < n; ++i) roots[i].scanned = now;
     } else {
@@ -6607,6 +6689,7 @@ static void register_persisted_roots(void) {
     ne_root_line roots[NE_MAX_ROOTS];
     int n = roots_file_read(roots, NE_MAX_ROOTS);
     int i;
+    if (n < 0) return;   /* unreadable: keep whatever is already registered */
     for (i = 0; i < n; ++i) (void)mn_app_register_root(g_app, roots[i].path);
 }
 
@@ -6653,8 +6736,13 @@ static DWORD WINAPI folder_watch_thread(LPVOID param) {
                     if (h[i] != INVALID_HANDLE_VALUE)
                         FindCloseChangeNotification(h[i]);
                 nh = 0;
-                roots_mtime = fad.ftLastWriteTime;
                 n = roots_file_read(roots, NE_MAX_ROOTS);
+                /* Commit the mtime only once the file actually parsed. The
+                 * rewrite in roots_file_write is a MoveFileEx over the live
+                 * file, so a poll landing mid-swap can fail the open; stamping
+                 * the mtime anyway would retire the rebuild and leave the
+                 * watcher dead until the next unrelated roots edit. */
+                if (n >= 0) roots_mtime = fad.ftLastWriteTime;
                 for (i = 0; i < n && nh < NE_MAX_ROOTS; ++i) {
                     wchar_t wpath[1024];
                     if (MultiByteToWideChar(CP_UTF8, 0, roots[i].path, -1, wpath,
@@ -6734,6 +6822,7 @@ static DWORD WINAPI roots_thread(LPVOID param) {
     ne_root_line roots[NE_MAX_ROOTS];
     int n = roots_file_read(roots, NE_MAX_ROOTS);
     strbuf b; sb_init(&b);
+    if (n < 0) n = 0;   /* unreadable: empty list, never a scan of roots[-1] */
     sb_puts(&b, "{\"type\":\"roots\",\"roots\":[");
     for (int i = 0; i < n; ++i) {
         int64_t tracks = 0, albums = 0, bytes = 0, newest = 0;

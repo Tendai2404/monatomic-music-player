@@ -543,6 +543,13 @@ static const char *const MN__SCHEMA_SQL =
     "CREATE INDEX IF NOT EXISTS idx_tracks_folder ON tracks(folder_id);"
     "CREATE INDEX IF NOT EXISTS idx_tracks_year ON tracks(year);"
     "CREATE INDEX IF NOT EXISTS idx_tracks_scan ON tracks(scan_epoch);"
+    /* The UNIQUE constraint on tracks.path yields a BINARY index, which no
+     * COLLATE NOCASE comparison can use — so both of the app's case-insensitive
+     * path accesses would otherwise full-scan tracks: the per-entry lookup in
+     * mn_library_track_id_by_path (playlist import) and the kind path-prefix
+     * ranges in mn__build_where. */
+    "CREATE INDEX IF NOT EXISTS idx_tracks_path_nocase "
+    "  ON tracks(path COLLATE NOCASE);"
     /* Moved-file relink identity probe (size, then duration range). */
     "CREATE INDEX IF NOT EXISTS idx_tracks_size ON tracks(size, duration_ms);"
     /* Covering indexes for the common sort orders (id tiebreak trailing). */
@@ -2865,13 +2872,26 @@ static void mn__build_where(mn__sb *sb, const mn_filter_spec *spec,
                 else
                     mn__sb_puts(sb, " OR ");
                 wrote++;
+                /* COLLATE NOCASE on BOTH operands: everywhere else in the app
+                 * paths compare case-insensitively (_strnicmp / _stricmp, and
+                 * the lookup in mn_library_track_id_by_path). A raw BINARY
+                 * range here: one case difference between folder_kinds.txt and
+                 * tracks.path put every track OUTSIDE the range — a named kind
+                 * showed an EMPTY library, and music's exclusion clause matched
+                 * nothing so that kind's content leaked back into music.
+                 * NOCASE folds ASCII a-z only; non-ASCII path bytes still
+                 * compare byte-wise, which is fine because the registry stores
+                 * the path exactly as the folder picker reported it. The
+                 * separator/increment bytes ('\\' 0x5C -> ']' 0x5D, '/' -> '0')
+                 * are non-letters, so the prefix range stays exact under the
+                 * fold: only 0x5C itself sits in ['\\', ']'). */
                 mn__sb_puts(sb, "(t.path >= '");
                 for (ci = 0; ci < rl; ci++) {
                     char lit[3] = { rbuf[ci], 0, 0 };
                     if (rbuf[ci] == '\'') lit[1] = '\'';   /* SQL-escape quote */
                     mn__sb_puts(sb, lit);
                 }
-                mn__sb_puts(sb, "' AND t.path < '");
+                mn__sb_puts(sb, "' COLLATE NOCASE AND t.path < '");
                 for (ci = 0; ci < rl; ci++) {
                     char cc = rbuf[ci];
                     char lit[3] = { 0, 0, 0 };
@@ -2880,7 +2900,7 @@ static void mn__build_where(mn__sb *sb, const mn_filter_spec *spec,
                     if (cc == '\'') lit[1] = '\'';
                     mn__sb_puts(sb, lit);
                 }
-                mn__sb_puts(sb, "')");
+                mn__sb_puts(sb, "' COLLATE NOCASE)");
             }
             if (wrote) mn__sb_puts(sb, ")");
             else if (spec->kind_include)
