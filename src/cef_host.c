@@ -10134,6 +10134,200 @@ static void mn_open_path_utf16(const wchar_t *wpath) {
     if (n > 0) mn_app_add_folder(g_app, u8);
 }
 
+/* ==========================================================================
+ * MAGNETIC WINDOW SIZING — the mini-player modes behave like detents.
+ *
+ * The UI picks its tier purely from the viewport (ui/app.js tierOf()), so a
+ * drag through a boundary used to flip the whole layout mid-motion and land
+ * on whatever arbitrary size the mouse happened to stop at. Here the window
+ * itself gains the feel: each mode SNAPS to a shape that suits it, and the
+ * boundary RESISTS — you have to mean it to leave a mode, and mean it more
+ * to climb back out of a small one.
+ *
+ * Thresholds below are CLIENT px and MUST mirror ui/app.js tierOf() exactly;
+ * if they drift, the window snaps to a size the UI then disagrees about.
+ * ========================================================================== */
+enum { NE_TIER_MICRO = 0, NE_TIER_MINI, NE_TIER_COMPACT, NE_TIER_FULL };
+
+static int  g_size_tier  = -1;    /* tier as the drag currently stands       */
+static int  g_tier_start = -1;    /* tier the drag BEGAN in                  */
+static int  g_snap_w = 0;         /* size we snapped to; 0 = not parked      */
+static int  g_snap_h = 0;
+/* How far the pointer must travel past a snap before free resizing resumes.
+ * Without this the snap is invisible: the very next WM_SIZING of the same
+ * drag is back inside the mode, takes the free-resize path, and drags the
+ * window straight off the shape it had just landed on. */
+#define NE_SNAP_DETENT 72
+
+static int ne_tier_of(int cw, int ch) {
+    if (cw < 360  || ch < 320) return NE_TIER_MICRO;
+    if (cw < 780  || ch < 460) return NE_TIER_MINI;
+    if (cw < 1180 || ch < 620) return NE_TIER_COMPACT;
+    return NE_TIER_FULL;
+}
+
+/* The shape each mode wants, in CLIENT px. Micro/mini carry two: past a 5/4
+ * aspect the layout is the horizontal strip, below it the stacked card. The
+ * ratio MUST be the 5/4 the stylesheet keys its own @media on, or the window
+ * settles into a shape the CSS then lays out the other way — a plain
+ * `cw >= ch` sent a nearly-square 350x340 micro window to the wide strip. */
+/* mirrors the stylesheet's @media (min-aspect-ratio:5/4) */
+static int ne_is_wide(int cw, int ch) { return cw * 4 >= ch * 5; }
+
+static void ne_tier_ideal(int tier, int wide, int *cw, int *ch) {
+    switch (tier) {
+        case NE_TIER_MICRO:   if (wide) { *cw = 760; *ch = 210; }
+                              else      { *cw = 340; *ch = 330; } break;
+        /* 1000x470 was NOT in the mini band (mini needs w<780 OR h<460), so
+         * settling a mini strip promoted the window to COMPACT. 440 keeps it
+         * mini. Every shape here must satisfy its own tier's test. */
+        case NE_TIER_MINI:    if (wide) { *cw = 1000; *ch = 440; }
+                              else      { *cw = 430;  *ch = 760; } break;
+        case NE_TIER_COMPACT: *cw = 1100; *ch = 700; break;
+        default:              *cw = 1400; *ch = 880; break;
+    }
+}
+
+/* Non-client padding for this window at its current DPI/theme. */
+static void ne_frame_pad(HWND hwnd, int *px, int *py) {
+    RECT wr, cr;
+    GetWindowRect(hwnd, &wr);
+    GetClientRect(hwnd, &cr);
+    *px = (wr.right - wr.left) - (cr.right - cr.left);
+    *py = (wr.bottom - wr.top) - (cr.bottom - cr.top);
+    if (*px < 0) *px = 0;
+    if (*py < 0) *py = 0;
+}
+
+/* Resize `r` to the given CLIENT size while keeping whichever edge the user
+ * is dragging under the cursor (otherwise the window bolts away from the
+ * mouse the instant it snaps). */
+static void ne_apply_size(RECT *r, WPARAM edge, int cw, int ch, int px, int py) {
+    int w = cw + px, h = ch + py;
+    switch (edge) {
+        case WMSZ_LEFT: case WMSZ_TOPLEFT: case WMSZ_BOTTOMLEFT:
+            r->left = r->right - w; break;
+        default:
+            r->right = r->left + w; break;
+    }
+    switch (edge) {
+        case WMSZ_TOP: case WMSZ_TOPLEFT: case WMSZ_TOPRIGHT:
+            r->top = r->bottom - h; break;
+        default:
+            r->bottom = r->top + h; break;
+    }
+}
+
+/* How far past a tier boundary the drag has pushed, in px — the larger of
+ * the two axes' overshoots, so a diagonal drag counts once. */
+static int ne_tier_overshoot(int cw, int ch, int from) {
+    int dx = 0, dy = 0;
+    switch (from) {
+        case NE_TIER_MICRO:   dx = cw - 360;  dy = ch - 320;  break;
+        case NE_TIER_MINI:    dx = cw - 780;  dy = ch - 460;  break;
+        case NE_TIER_COMPACT: dx = cw - 1180; dy = ch - 620;  break;
+        default: return 1 << 20;   /* leaving FULL downward: no resistance */
+    }
+    if (dx < 0) dx = -dx;
+    if (dy < 0) dy = -dy;
+    return dx > dy ? dx : dy;
+}
+
+static void ne_magnetic_sizing(HWND hwnd, WPARAM edge, RECT *r) {
+    int px, py, cw, ch, want, ideal_w, ideal_h, wide, resist;
+
+    ne_frame_pad(hwnd, &px, &py);
+    cw = (r->right - r->left) - px;
+    ch = (r->bottom - r->top) - py;
+    if (cw < 1 || ch < 1) return;
+
+    if (g_size_tier < 0) g_size_tier = ne_tier_of(cw, ch);
+
+    want = ne_tier_of(cw, ch);
+    if (want == g_size_tier) return;          /* free resize inside a mode */
+
+    /* RESISTANCE. Climbing OUT of a mini/micro mode is the deliberate act —
+     * you are abandoning the widget — so it costs the most. Dropping INTO a
+     * smaller mode only needs a nudge. */
+    resist = (want > g_size_tier)
+           ? ((g_size_tier <= NE_TIER_MINI) ? 110 : 60)   /* getting bigger */
+           : 26;                                          /* getting smaller */
+
+    if (ne_tier_overshoot(cw, ch, g_size_tier) < resist) {
+        /* Not committed yet: hold the window at the boundary so the drag
+         * visibly stiffens instead of silently flipping the layout. */
+        int hold_w, hold_h;
+        ne_tier_ideal(g_size_tier, ne_is_wide(cw, ch), &hold_w, &hold_h);
+        switch (g_size_tier) {
+            case NE_TIER_MICRO:   hold_w = 359;  hold_h = 319;  break;
+            case NE_TIER_MINI:    hold_w = 779;  hold_h = 459;  break;
+            case NE_TIER_COMPACT: hold_w = 1179; hold_h = 619;  break;
+            default: break;
+        }
+        if (want > g_size_tier) {
+            if (cw > hold_w) cw = hold_w;
+            if (ch > hold_h) ch = hold_h;
+            ne_apply_size(r, edge, cw, ch, px, py);
+        }
+        return;
+    }
+
+    /* Boundary crossed for real. Record the new mode and let the drag run on
+     * freely — the SHAPE is applied when the drag ENDS (ne_settle_size), not
+     * here. Snapping mid-drag looked right in a straight pull but fell apart
+     * diagonally: entering mini around 780x460 wants a 900-wide strip, so the
+     * window lurched OUTWARD against the drag and the pointer was instantly
+     * far enough away to break the detent again. Settling on release keeps
+     * the whole drag free and predictable, and still lands you on the mode's
+     * proper shape. */
+    (void)ideal_w; (void)ideal_h; (void)wide;
+    g_size_tier = want;
+    g_snap_w = g_snap_h = 0;
+}
+
+/* Called once, on WM_EXITSIZEMOVE: settle a mini-player mode onto the shape
+ * it is designed around. FULL is left exactly where the user put it — that
+ * is a working window, not a widget. */
+static void ne_settle_size(HWND hwnd) {
+    RECT wr, cr;
+    int cw, ch, tier, px, py, want_w, want_h;
+
+    if (IsZoomed(hwnd) || IsIconic(hwnd)) return;
+    GetClientRect(hwnd, &cr);
+    cw = cr.right - cr.left;
+    ch = cr.bottom - cr.top;
+    tier = ne_tier_of(cw, ch);
+    if (tier >= NE_TIER_COMPACT) return;      /* only the widget modes snap */
+    /* Snap only when the drag actually ENTERED this mode. Sizing WITHIN a
+     * mode has to stay free — otherwise every nudge springs back to the
+     * canonical shape and the window feels stuck rather than magnetic. */
+    if (g_tier_start == tier) return;
+
+    /* Pick the NEARER of the mode's two shapes rather than trusting the
+     * aspect alone: a 300x240 micro window sits exactly on 5/4 and would be
+     * flung out to the 760-wide strip. Nearest keeps every settle a small,
+     * predictable nudge, and still agrees with the stylesheet — the closer
+     * shape is on the same side of 5/4 as the window already is. */
+    {
+        int aw, ah, bw, bh, da, db;
+        ne_tier_ideal(tier, 1, &aw, &ah);          /* strip  */
+        ne_tier_ideal(tier, 0, &bw, &bh);          /* card   */
+        da = (aw > cw ? aw - cw : cw - aw);
+        { int t = (ah > ch ? ah - ch : ch - ah); if (t > da) da = t; }
+        db = (bw > cw ? bw - cw : cw - bw);
+        { int t = (bh > ch ? bh - ch : ch - bh); if (t > db) db = t; }
+        if (da <= db) { want_w = aw; want_h = ah; }
+        else          { want_w = bw; want_h = bh; }
+    }
+    if (cw == want_w && ch == want_h) return;
+
+    ne_frame_pad(hwnd, &px, &py);
+    GetWindowRect(hwnd, &wr);
+    SetWindowPos(hwnd, NULL, wr.left, wr.top,
+                 want_w + px, want_h + py,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     /* Shell broadcast: the taskbar button exists (fires on window creation
      * AND whenever Explorer restarts) — (re)attach the thumbnail toolbar. */
@@ -10158,11 +10352,48 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * suspended for the whole drag. Keep playback ticking with a real
              * timer, and mark the drag so resize coalesces harder. */
             g_in_sizemove = 1;
+            /* Latch the mode this drag STARTS in: resistance is measured
+             * against where you came from, not against wherever the pointer
+             * currently is. */
+            {
+                RECT cr;
+                GetClientRect(hwnd, &cr);
+                g_size_tier  = ne_tier_of(cr.right - cr.left, cr.bottom - cr.top);
+                g_tier_start = g_size_tier;
+                g_snap_w = g_snap_h = 0;
+            }
             SetTimer(hwnd, NE_SIZEMOVE_TICK_ID, 16, NULL);
             return 0;
+        case WM_SIZING:
+            /* Magnetic modes: snap into a mini-player shape, resist leaving
+             * it. Returning TRUE tells Windows we adjusted the rect. */
+            ne_magnetic_sizing(hwnd, wp, (RECT *)lp);
+            return TRUE;
+        case WM_GETMINMAXINFO: {
+            /* The default minimum is far larger than the widget shapes, so
+             * without this the micro modes are unreachable by drag.
+             * DefWindowProc MUST run first: it is what fills in the maximum
+             * track size and the maximized rect. Overriding the minimum on
+             * an unpopulated struct leaves the maximum at zero, and Windows
+             * then refuses to resize the window AT ALL. */
+            MINMAXINFO *mmi = (MINMAXINFO *)lp;
+            int px = 0, py = 0;
+            LRESULT dr = DefWindowProcW(hwnd, msg, wp, lp);
+            ne_frame_pad(hwnd, &px, &py);
+            mmi->ptMinTrackSize.x = 240 + px;
+            mmi->ptMinTrackSize.y = 150 + py;
+            return dr;
+        }
         case WM_EXITSIZEMOVE:
             g_in_sizemove = 0;
             KillTimer(hwnd, NE_SIZEMOVE_TICK_ID);
+            /* settle BEFORE clearing the latch — ne_settle_size compares the
+             * final mode against g_tier_start to tell "entered a mode" from
+             * "resized within one", and clearing first made every drag look
+             * like an entry, so sizing inside a mode sprang back. */
+            ne_settle_size(hwnd);         /* land on the mode's shape */
+            g_size_tier = g_tier_start = -1;  /* next drag re-latches */
+            g_snap_w = g_snap_h = 0;
             resize_browser_to_client();   /* one authoritative final resize */
             return 0;
         case WM_SIZE:
