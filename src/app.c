@@ -5276,6 +5276,50 @@ void mn_app_set_content_hash(mn_app *app, int64_t track_id, const char *hash,
     MN_UNLOCK(&app->lib_lock);
 }
 
+/* Fingerprinted rows for the "on phone?" presence probe: (id, hash) pairs
+ * collected off one sync enumerate (all=true streams every track; rows the
+ * backfill hasn't hashed yet report content_hash NULL and are skipped). */
+struct mn_app_hashed_collect {
+    int64_t *ids;
+    char   (*hashes)[24];
+    int      max;
+    int      n;
+};
+
+static void mn_app_hashed_cb(void *user, int64_t track_id,
+                             const char *artist, const char *title,
+                             const char *album, int64_t duration_ms,
+                             int32_t liked, int32_t rating_x2,
+                             int64_t play_count, int64_t last_played,
+                             int64_t pref_updated_ms,
+                             int64_t votes_updated_ms,
+                             const char *content_hash)
+{
+    struct mn_app_hashed_collect *c = (struct mn_app_hashed_collect *)user;
+    (void)artist; (void)title; (void)album; (void)duration_ms;
+    (void)liked; (void)rating_x2; (void)play_count; (void)last_played;
+    (void)pref_updated_ms; (void)votes_updated_ms;
+    if (c->n >= c->max || !content_hash || !content_hash[0]) return;
+    c->ids[c->n] = track_id;
+    mn_copy_str(c->hashes[c->n], sizeof(c->hashes[c->n]), content_hash);
+    c->n++;
+}
+
+int mn_app_hashed_rows(mn_app *app, int64_t *ids, char (*hashes)[24],
+                       int max)
+{
+    struct mn_app_hashed_collect c;
+    if (!app || !ids || !hashes || max <= 0) return 0;
+    c.ids    = ids;
+    c.hashes = hashes;
+    c.max    = max;
+    c.n      = 0;
+    MN_LOCK(&app->lib_lock);
+    (void)mn_library_sync_enumerate(app->lib, true, mn_app_hashed_cb, &c);
+    MN_UNLOCK(&app->lib_lock);
+    return c.n;
+}
+
 /* All remembered chapter positions within one book. */
 int mn_app_book_chapters(mn_app *app, int64_t album_id, int64_t *track_ids,
                          int64_t *pos_ms, int max)
@@ -7296,6 +7340,24 @@ void mn_app_set_sync_fields(mn_app *app, bool likes, bool ratings, bool plays)
     g_sync_skip_plays   = !plays;
 }
 
+/* Remote-control pairing info the snapshot carries to the phone (the host
+ * sets it once at startup after minting/loading the token). Empty token =
+ * no control block emitted. */
+static int  g_control_port = 0;
+static char g_control_token[128];
+static char g_control_name[64];
+
+void mn_app_set_control_info(mn_app *app, int port, const char *token,
+                             const char *name)
+{
+    (void)app;
+    g_control_port = port;
+    snprintf(g_control_token, sizeof(g_control_token), "%s",
+             token ? token : "");
+    snprintf(g_control_name, sizeof(g_control_name), "%s",
+             name ? name : "");
+}
+
 static void mn_app_sync_env(mn_app *app, mn_sync_env *env)
 {
     env->lib            = app->lib;
@@ -7305,6 +7367,10 @@ static void mn_app_sync_env(mn_app *app, mn_sync_env *env)
     env->fields.likes   = !g_sync_skip_likes;
     env->fields.ratings = !g_sync_skip_ratings;
     env->fields.plays   = !g_sync_skip_plays;
+    env->counts_out     = NULL;   /* callers opt in per flow */
+    env->control_port   = g_control_port;
+    env->control_token  = g_control_token[0] ? g_control_token : NULL;
+    env->control_name   = g_control_name[0] ? g_control_name : NULL;
 }
 
 /* A merge changed rows: the browse query + album cache are stale. */
@@ -7326,6 +7392,7 @@ struct mn_app_sync_relay {
 
 static void mn_app_sync_progress(void *user, const char *state,
                                  int applied, int skipped, int pushed,
+                                 int by_hash, int by_id,
                                  const char *error)
 {
     struct mn_app_sync_relay *r = (struct mn_app_sync_relay *)user;
@@ -7333,11 +7400,12 @@ static void mn_app_sync_progress(void *user, const char *state,
         r->applied = applied;
     }
     if (r->cb) {
-        r->cb(r->user, state, applied, skipped, pushed, error);
+        r->cb(r->user, state, applied, skipped, pushed, by_hash, by_id, error);
     }
 }
 
 bool mn_app_sync_run(mn_app *app, const char *host, int port,
+                     mn_sync_counts *counts_out,
                      mn_app_sync_cb cb, void *user)
 {
     mn_sync_env              env;
@@ -7348,6 +7416,12 @@ bool mn_app_sync_run(mn_app *app, const char *host, int port,
         return false;
     }
     mn_app_sync_env(app, &env);
+    /* per-category "what got synced" tallies land in the CALLER's struct
+     * (zeroed here) so the done-event can tell the story in plain words */
+    if (counts_out) {
+        memset(counts_out, 0, sizeof(*counts_out));
+        env.counts_out = counts_out;
+    }
     relay.cb      = cb;
     relay.user    = user;
     relay.applied = 0;

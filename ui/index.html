@@ -14,6 +14,62 @@
   <div id="resizer-np" class="resizer" title="Drag to resize"></div>
   <div id="resizer-player" class="resizer-row" title="Drag to resize"></div>
 
+  <!-- MINI/MICRO ONLY: keep-window-on-top pin. Un-hidden by app.js when the
+       window shrinks into the widget tiers; sends {cmd:"alwaystop"} (a
+       harmless no-op if the C side has no handler yet). -->
+  <button id="btn-ontop" class="mini-pin" type="button" hidden
+          aria-pressed="false" title="Keep window on top" aria-label="Keep window on top">📌</button>
+
+  <!-- MINI/MICRO ONLY: COMPACT STEM MIXER ------------------------------
+       The full #stem-dock has no room in a widget, but the nine-channel
+       neural mixer is the whole point of the app — so the small tiers get
+       a second VIEW of the SAME model, never a second model: every control
+       in here calls the very functions the dock calls (setFaderGain /
+       stemSetMute / stemSetSolo / applyStemPreset / setStemMaster), and
+       those functions paint BOTH mixers. Change a channel in either one
+       and the other is already correct when the window is resized.
+
+       Collapsed by default (this is a now-playing card first); the choice
+       persists in localStorage "mn.ministems". The channel grid is built
+       LAZILY on first open, and its meters only animate while the sheet is
+       actually open — see msMetersLive() in app.js (idle-CPU contract).
+       Hidden entirely for radio/podcasts: C forces stems_available and
+       stems_enabled false for an online source (mn_app_now_impl). -->
+  <div id="ministems" class="mini-stems">
+    <button id="ms-toggle" class="ms-toggle" type="button"
+            aria-expanded="false" aria-controls="ms-sheet"
+            title="Stem mixer" aria-label="Stem mixer">
+      <span class="ms-mark" aria-hidden="true"></span><span>Stems</span>
+    </button>
+    <div id="ms-sheet" class="ms-sheet" hidden role="group" aria-label="Stem mixer">
+      <div class="ms-head">
+        <label class="switch ms-sw" title="AI Stems — split playback into nine live channels">
+          <input type="checkbox" id="ms-enable"><span class="track"></span><span class="switch-label">AI</span>
+        </label>
+        <button id="ms-pass" class="ms-pill" type="button" aria-pressed="false"
+                title="Neural stems vs. the original untouched audio">NEURAL</button>
+        <span id="ms-status" class="ms-status-mini">idle</span>
+        <button id="ms-close" class="ms-x" type="button"
+                title="Close stem mixer (Esc)" aria-label="Close stem mixer">✕</button>
+      </div>
+      <div id="ms-body" class="ms-body">
+        <div id="ms-presets" class="stem-presets ms-presets"></div>
+        <div id="ms-chans" class="ms-chans"></div>
+        <div class="ms-master">
+          <span class="ms-master-lab">Mst</span>
+          <div class="ms-master-track" id="ms-master-track" role="slider" tabindex="0"
+               aria-label="Master stem level" aria-orientation="horizontal"
+               aria-valuemin="0" aria-valuemax="100" aria-valuenow="100"
+               title="Master stem level — scales all nine channels">
+            <div class="ms-master-fill" id="ms-master-fill"></div>
+          </div>
+          <span class="ms-master-val" id="ms-master-val">100</span>
+        </div>
+      </div>
+      <div id="ms-note" class="ms-note" hidden></div>
+    </div>
+  </div>
+
   <!-- ============ LEFT SIDEBAR ============ -->
   <aside id="sidebar">
     <div class="brand">
@@ -140,7 +196,6 @@
             <option value="genre">Genre</option>
             <option value="year">Year</option>
             <option value="duration">Duration</option>
-            <option value="rating">Rating</option>
             <option value="plays">Play count</option>
             <option value="added">Date added</option>
             <option value="created" title="The file's real creation date — a bulk import shares one Date added, but each file keeps its own creation date">Date created</option>
@@ -178,7 +233,7 @@
           <div class="th col-year sortable" data-sort="year">Year</div>
           <div class="th col-genre sortable" data-sort="genre">Genre</div>
           <div class="th col-dur sortable" data-sort="duration">Time</div>
-          <div class="th col-rating sortable" data-sort="rating">Rating</div>
+          <div class="th col-like">Like</div>
         </div>
         <div id="track-scroll" class="track-scroll">
           <div id="track-rows"></div>
@@ -304,6 +359,7 @@
           </div>
           <label class="switch"><input type="checkbox" id="stem-enable"><span class="track"></span><span class="switch-label">AI Stems</span></label>
           <label class="switch"><input type="checkbox" id="stem-passthrough"><span class="track"></span><span class="switch-label">Passthrough</span></label>
+          <button id="stem-clearcache" class="btn btn-ghost" title="Delete every cached separation (*.mnstems). Cached tracks replay instantly instead of re-separating, and the cache is keyed by track ONLY — so a track separated by an earlier model keeps playing that model's stems until it is cleared. Clear this after switching the stems model.">Clear cache</button>
           <button id="stem-collapse" class="btn btn-ghost" title="Collapse stem dock" aria-label="Collapse stem dock" aria-expanded="true">▾</button>
         </div>
       </div>
@@ -410,7 +466,18 @@
             </div>
           </div>
         </div>
-        <button id="sync-pill" class="sync-pill" hidden title="Library sync">SYNC</button>
+        <!-- PHONE CHIP: live state of the ACTIVE sync device (green dot =
+             answering discovery on this network right now; gray = not seen;
+             pulse = syncing; red = last sync failed; dimmed = nothing set
+             up). Painted by sync.js off the ambient presence events —
+             zero per-frame work. Click opens Settings → Sync. -->
+        <button id="sync-pill" class="sync-pill phone-chip" title="Phone sync">
+          <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+            <rect x="7" y="2.5" width="10" height="19" rx="2.4" fill="none" stroke="currentColor" stroke-width="2"/>
+            <circle cx="12" cy="18" r="1.2" fill="currentColor"/>
+          </svg>
+          <span id="sync-pill-dot" class="pc-dot" aria-hidden="true"></span>
+        </button>
         <button id="btn-art3d" class="btn btn-ghost" title="3D album art on/off — turn off on low-power machines to stop the volumetric renderer entirely">◧</button>
         <button id="btn-stems" class="btn btn-stems">Stems</button>
       </div>
@@ -888,18 +955,40 @@
           <!-- ================= SYNC ================= -->
           <div class="set-tab" data-tab="sync" hidden>
             <div class="set-section">
-              <div class="set-label">Phone connection</div>
-              <div class="set-hint">Your phone runs the sync server: open the Android app and go
-                to <b>Settings → Library Sync</b> — it shows the address to enter below. Likes,
-                ratings and play counts merge in both directions over your local network.</div>
+              <div class="set-label">Your devices</div>
+              <div class="set-hint">Devices on the same Wi-Fi detect each other automatically —
+                on the phone, open the Android app and switch <b>Settings → Library Sync →
+                Sync server</b> on. One device is the <b>active</b> sync target: likes, play
+                counts and audiobook positions merge with it in both directions, and its
+                address follows the device automatically when your router hands it a new one.</div>
+              <div id="sync-devlist" class="sync-devlist" aria-label="Registered sync devices"></div>
+            </div>
+
+            <div class="set-section">
+              <div class="set-label">Nearby devices</div>
+              <div class="set-hint">Found on your network but not added yet — adding is always
+                your choice, nothing is paired automatically. The list refreshes on its own
+                every 30 seconds.</div>
+              <div id="sync-foundlist" class="sync-foundlist" aria-label="Discovered devices"></div>
               <div class="set-row">
-                <span class="set-name">Phone address</span>
+                <span class="set-name">Search</span>
+                <div class="set-ctl">
+                  <button id="sync-find" class="btn btn-ghost" title="Probe the local network right now instead of waiting for the automatic scan">Find devices</button>
+                  <button id="sync-manual-btn" class="btn btn-ghost" title="For networks where broadcast discovery is filtered — type the address the phone's sync screen shows">Add by address…</button>
+                </div>
+              </div>
+              <div class="set-row" id="sync-manual" hidden>
+                <span class="set-name">Address</span>
                 <div class="set-ctl">
                   <input type="text" id="sync-host" class="set-input" placeholder="192.168.1.23" spellcheck="false" autocomplete="off">
                   <input type="number" id="sync-port" class="set-input sync-port" value="8797" min="1" max="65535" title="Port (default 8797)">
-                  <button id="sync-save" class="btn btn-ghost">Save</button>
+                  <button id="sync-add-manual" class="btn btn-ghost">Add device</button>
                 </div>
               </div>
+            </div>
+
+            <div class="set-section">
+              <div class="set-label">Background sync</div>
               <div class="set-row">
                 <span class="set-name">Automatic sync</span>
                 <label class="switch" title="Sync in the background whenever the phone is reachable"><input type="checkbox" id="sync-auto"><span class="track"></span></label>
@@ -925,10 +1014,6 @@
                 <label class="switch"><input type="checkbox" id="sync-f-likes" checked><span class="track"></span></label>
               </div>
               <div class="set-row">
-                <span class="set-name">Star ratings</span>
-                <label class="switch"><input type="checkbox" id="sync-f-ratings" checked><span class="track"></span></label>
-              </div>
-              <div class="set-row">
                 <span class="set-name">Play counts &amp; last played</span>
                 <label class="switch"><input type="checkbox" id="sync-f-plays" checked><span class="track"></span></label>
               </div>
@@ -942,6 +1027,32 @@
               <div class="set-row">
                 <span class="set-name">Run a sync</span>
                 <button id="sync-now" class="btn btn-ghost">Sync now</button>
+              </div>
+            </div>
+            <div class="set-section">
+              <div class="set-label">Activity</div>
+              <div class="set-hint">Everything sync-related, newest first: syncs with per-category
+                counts, devices appearing and disappearing, address changes, registry edits.
+                The last 300 entries are shown; the full history lives in
+                <b>sync\activity.jsonl</b> in the app's data folder.</div>
+              <div id="sync-logbox" class="sync-log" hidden></div>
+              <div class="set-row">
+                <span class="set-name">Sync log</span>
+                <div class="set-ctl">
+                  <button id="sync-log-toggle" class="btn btn-ghost">Show log</button>
+                  <button id="sync-log-refresh" class="btn btn-ghost" hidden>Refresh</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="set-section">
+              <div class="set-label">Send files to the phone</div>
+              <div class="set-hint">Copy music to the phone over Wi-Fi: drop audio files
+                anywhere in this window, or pick them here. Files the phone already has
+                are skipped automatically.</div>
+              <div class="set-row">
+                <span class="set-name">Wireless transfer</span>
+                <button id="sync-sendfiles" class="btn btn-ghost" title="Pick audio files to copy to the phone over Wi-Fi (or just drag files into the window)">Send files to phone…</button>
               </div>
             </div>
             <div class="set-section">
@@ -1123,6 +1234,7 @@
 <script src="tagedit.js"></script>
 <script src="app.js"></script>
 <script src="sync.js"></script>
+<script src="synchud.js"></script>
 <script src="artwarm.js"></script>
 <script src="uiresize.js"></script>
 <script src="resizers.js"></script>

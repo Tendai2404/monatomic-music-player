@@ -347,6 +347,12 @@ bool mn_app_root_stats(mn_app *app, const char *root,
  * ones. Defaults: all enabled. */
 void mn_app_set_sync_fields(mn_app *app, bool likes, bool ratings, bool plays);
 
+/* Remote-control pairing info carried inside pushed sync snapshots (the
+ * "control" block): the phone learns where the desktop's control listener
+ * lives and its shared token. Empty/NULL token disables emission. */
+void mn_app_set_control_info(mn_app *app, int port, const char *token,
+                             const char *name);
+
 /* Load persisted settings (<data_dir>\settings.txt) over the current values.
  * Called once by mn_app_create; exposed for tests. */
 void mn_app_load_settings(mn_app *app);
@@ -724,6 +730,12 @@ int mn_app_hashless_rows(mn_app *app, int64_t *ids, char (*paths)[1024],
 void mn_app_set_content_hash(mn_app *app, int64_t track_id, const char *hash,
                              bool force);
 
+/* The opposite feed: rows that ALREADY carry a fingerprint, as parallel
+ * (track id, 16-hex hash) arrays — the "on phone?" presence probe asks the
+ * phone which of these it has. Returns entries filled (<= max). */
+int mn_app_hashed_rows(mn_app *app, int64_t *ids, char (*hashes)[24],
+                       int max);
+
 /* ================================================================== */
 /* Neural stem separation                                            */
 /* ================================================================== */
@@ -1017,18 +1029,28 @@ int mn_app_queue(mn_app *app, mn_queue_item *out, int max, int *out_current);
  * thread per state change. `state` is one of
  *     "connecting" | "pulling" | "merging" | "pushing" | "done" | "error"
  * applied/skipped are the LOCAL merge counts, pushed is what the phone
- * reported applying from our snapshot; `error` is "" except on "error".
+ * reported applying from our snapshot; by_hash/by_id split the matched
+ * remote records by match path (content fingerprint vs tag identity);
+ * `error` is "" except on "error".
  */
 typedef void (*mn_app_sync_cb)(void *user, const char *state,
                                int applied, int skipped, int pushed,
+                               int by_hash, int by_id,
                                const char *error);
+
+/* Same struct sync.h defines (benign identical forward declaration — this
+ * header stays free of the sync module's full contract). */
+typedef struct mn_sync_counts mn_sync_counts;
 
 /* Full HTTP sync against the phone's server at host:port (ping -> pull ->
  * merge -> push). BLOCKING — worker thread only. Library access serializes
  * against the scanner/UI via the app lock; the browse query + album cache
- * are invalidated when the merge changed rows. Returns true on a completed
- * flow. */
+ * are invalidated when the merge changed rows. `counts_out` (optional) is
+ * zeroed, then receives the per-category tallies of what the local merge
+ * changed (the "what got synced" summary); final once the flow reaches
+ * "pushing"/"done". Returns true on a completed flow. */
 bool mn_app_sync_run(mn_app *app, const char *host, int port,
+                     mn_sync_counts *counts_out,
                      mn_app_sync_cb cb, void *user);
 
 /* Export this library's snapshot JSON to `path_or_null` (NULL -> the default

@@ -472,6 +472,10 @@ static const char *const MN__SCHEMA_SQL =
     "  rating_x2 INTEGER NOT NULL DEFAULT 0,"
     "  liked INTEGER NOT NULL DEFAULT 0,"
     "  pref_updated_ms INTEGER NOT NULL DEFAULT 0,"
+    /* v8: epoch ms of the last LOCAL like/dislike CHANGE (votes only —
+     * never ratings, never plays). The vote-specific LWW clock peers
+     * need before clearing a vote. 0 = never voted locally. */
+    "  votes_updated_ms INTEGER NOT NULL DEFAULT 0,"
     "  has_art INTEGER NOT NULL DEFAULT 0,"
     "  missing INTEGER NOT NULL DEFAULT 0,"
     "  scan_epoch INTEGER NOT NULL DEFAULT 0,"
@@ -897,6 +901,23 @@ mn_status mn_library_migrate(mn_library *lib) {
         (void)mn__exec(lib->writer.db,
             "CREATE INDEX IF NOT EXISTS idx_tracks_content_hash "
             "ON tracks(content_hash) WHERE content_hash IS NOT NULL;");
+        /* v7 -> v8: votes_updated_ms — the vote-specific LWW clock (see
+         * MN_SCHEMA_VERSION docs). The ALTER's duplicate-column failure on
+         * fresh dbs is expected and ignored (same as v1 -> v2). The
+         * BACKFILL is the load-bearing half: every already-voted row must
+         * not sit at stamp 0, or any peer stamp — however stale — could
+         * clear the vote (mirrors Android's LikesStore.load one-time
+         * SyncClock.ensureVoteStamps migration). */
+        if (ver < 8) {
+            (void)mn__exec(lib->writer.db,
+                "ALTER TABLE tracks ADD COLUMN "
+                "votes_updated_ms INTEGER NOT NULL DEFAULT 0;");
+            (void)mn__exec(lib->writer.db,
+                "UPDATE tracks SET votes_updated_ms = CASE"
+                " WHEN pref_updated_ms > 0 THEN pref_updated_ms"
+                " ELSE (strftime('%s','now')*1000) END"
+                " WHERE liked != 0 AND votes_updated_ms = 0;");
+        }
         st = mn__write_user_version(lib->writer.db, MN_SCHEMA_VERSION);
         if (st != MN_OK) { mn__set_err_db(lib, lib->writer.db); goto done; }
         ver = MN_SCHEMA_VERSION;
@@ -2534,8 +2555,12 @@ mn_status mn_library_set_liked(mn_library *lib, int64_t track_id,
                                int32_t liked) {
     if (liked < -1) liked = -1;
     if (liked >  1) liked = 1;
+    /* votes_updated_ms moves HERE and only here (v8): a vote change. It is
+     * deliberately NOT stamped by set_rating or the play/skip bumps — its
+     * whole value is proving to a sync peer that the VOTE state changed. */
     return mn__simple_write3(lib,
-        "UPDATE tracks SET liked=?1, pref_updated_ms=?2 WHERE id=?3;",
+        "UPDATE tracks SET liked=?1, pref_updated_ms=?2, votes_updated_ms=?2"
+        " WHERE id=?3;",
         (int64_t)liked, mn__now_ms(), track_id);
 }
 
@@ -2571,10 +2596,10 @@ mn_status mn_library_get_liked(mn_library *lib, int64_t track_id,
 mn_status mn_library_sync_apply(mn_library *lib, int64_t track_id,
                                 int liked, int disliked, int stars,
                                 int64_t play_count, int64_t last_played_ms,
-                                int64_t updated_ms) {
+                                int64_t updated_ms, int64_t votes_updated_ms) {
     static const char *SQL =
         "UPDATE tracks SET liked=?1, rating_x2=?2, play_count=?3,"
-        " last_played=?4, pref_updated_ms=?5 WHERE id=?6;";
+        " last_played=?4, pref_updated_ms=?5, votes_updated_ms=?6 WHERE id=?7;";
     sqlite3_stmt *st;
     int rc;
     int32_t thumbs;
@@ -2589,6 +2614,7 @@ mn_status mn_library_sync_apply(mn_library *lib, int64_t track_id,
     if (play_count < 0) play_count = 0;
     if (last_played_ms < 0) last_played_ms = 0;
     if (updated_ms < 0) updated_ms = 0;
+    if (votes_updated_ms < 0) votes_updated_ms = 0;
 
     mn__write_lock(lib);
     st = mn__stmt_get(lib->writer.db, &lib->writer.cache, SQL, &rc);
@@ -2598,7 +2624,8 @@ mn_status mn_library_sync_apply(mn_library *lib, int64_t track_id,
     sqlite3_bind_int64(st, 3, play_count);
     sqlite3_bind_int64(st, 4, last_played_ms / 1000);  /* ms -> unix seconds */
     sqlite3_bind_int64(st, 5, updated_ms);
-    sqlite3_bind_int64(st, 6, track_id);
+    sqlite3_bind_int64(st, 6, votes_updated_ms);
+    sqlite3_bind_int64(st, 7, track_id);
     rc = sqlite3_step(st);
     sqlite3_reset(st);
     if (rc != SQLITE_DONE) mn__set_err_db(lib, lib->writer.db);
@@ -2609,13 +2636,20 @@ mn_status mn_library_sync_apply(mn_library *lib, int64_t track_id,
 mn_status mn_library_sync_enumerate(mn_library *lib, bool all,
                                     mn_library_sync_cb cb, void *user) {
     /* Two literal SQL strings so each gets its own cached statement. */
+    /* NONDEFAULT also includes votes_updated_ms>0 rows: a track whose vote
+     * was CLEARED (liked back to 0, no plays) still has news for peers —
+     * the un-like itself. Without it a cleared vote on an otherwise-default
+     * row would never leave this library. */
     static const char *SQL_ALL =
         "SELECT id, artist, title, album, duration_ms, liked, rating_x2,"
-        " play_count, last_played, pref_updated_ms FROM tracks;";
+        " play_count, last_played, pref_updated_ms, votes_updated_ms,"
+        " content_hash FROM tracks;";
     static const char *SQL_NONDEFAULT =
         "SELECT id, artist, title, album, duration_ms, liked, rating_x2,"
-        " play_count, last_played, pref_updated_ms FROM tracks"
-        " WHERE liked<>0 OR rating_x2>0 OR play_count>0 OR last_played>0;";
+        " play_count, last_played, pref_updated_ms, votes_updated_ms,"
+        " content_hash FROM tracks"
+        " WHERE liked<>0 OR rating_x2>0 OR play_count>0 OR last_played>0"
+        " OR votes_updated_ms>0;";
     sqlite3_stmt *st;
     int rc;
 
@@ -2642,11 +2676,211 @@ mn_status mn_library_sync_enumerate(mn_library *lib, bool all,
            sqlite3_column_int(st, 6),
            sqlite3_column_int64(st, 7),
            sqlite3_column_int64(st, 8),
-           sqlite3_column_int64(st, 9));
+           sqlite3_column_int64(st, 9),
+           sqlite3_column_int64(st, 10),
+           /* content_hash: NULL (not "") when not yet computed — the
+            * fingerprint sync path keys off that distinction */
+           (const char *)sqlite3_column_text(st, 11));
     }
     sqlite3_reset(st);
     mn__write_unlock(lib);
     return MN_OK;
+}
+
+/* --------------------------------------------------------------------------
+ * Audiobook progress sync: bulk enumerate + LWW apply (see library_db.h)
+ * -------------------------------------------------------------------------- */
+
+mn_status mn_library_book_sync_enumerate(mn_library *lib,
+                                         mn_library_book_sync_cb cb,
+                                         void *user) {
+    /* JOIN drops rows whose track was deleted outright (their identity is
+     * gone with the tags anyway); missing=1 tracks are KEPT — a detached
+     * drive must not silently withhold book positions from a sync. */
+    static const char *SQL =
+        "SELECT bp.album_id, bp.track_id, t.artist, t.title, t.album,"
+        " t.duration_ms, COALESCE(t.content_hash, bp.content_hash),"
+        " bp.pos_ms, bp.percent, bp.finished, bp.current, bp.updated"
+        " FROM book_progress bp JOIN tracks t ON t.id = bp.track_id;";
+    sqlite3_stmt *st;
+    int rc;
+
+    if (!lib || !cb) return MN_ERR_INVALID;
+
+    mn__write_lock(lib);
+    st = mn__stmt_get(lib->writer.db, &lib->writer.cache, SQL, &rc);
+    if (!st) { mn__write_unlock(lib); return mn__map_sqlite(rc); }
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *artist = (const char *)sqlite3_column_text(st, 2);
+        const char *title  = (const char *)sqlite3_column_text(st, 3);
+        const char *album  = (const char *)sqlite3_column_text(st, 4);
+        cb(user,
+           sqlite3_column_int64(st, 0),
+           sqlite3_column_int64(st, 1),
+           artist ? artist : "",
+           title  ? title  : "",
+           album  ? album  : "",
+           sqlite3_column_int64(st, 5),
+           (const char *)sqlite3_column_text(st, 6),   /* NULL = no hash */
+           sqlite3_column_int64(st, 7),
+           sqlite3_column_double(st, 8),
+           sqlite3_column_int(st, 9) != 0,
+           sqlite3_column_int(st, 10) != 0,
+           sqlite3_column_int64(st, 11));
+    }
+    sqlite3_reset(st);
+    mn__write_unlock(lib);
+    return MN_OK;
+}
+
+mn_status mn_library_book_sync_apply(mn_library *lib, int64_t album_id,
+                                     int64_t track_id, int64_t pos_ms,
+                                     bool has_finished, bool finished,
+                                     bool want_current, int64_t updated_s,
+                                     bool *out_changed) {
+    static const char *GET =
+        "SELECT updated, current, finished FROM book_progress"
+        " WHERE album_id=?1 AND track_id=?2;";
+    /* Newest updated among the album's current rows: the bar a remote
+     * record must beat to steal the resume target. */
+    static const char *CURUPD =
+        "SELECT COALESCE(MAX(updated),0) FROM book_progress"
+        " WHERE album_id=?1 AND current=1;";
+    /* Same whole-book percent + hash snapshot as mn_library_book_note:
+     * percent is a LOCAL derivation (this library's chapter durations),
+     * never trusted from the wire. */
+    static const char *PCT =
+        "SELECT"
+        " (SELECT COALESCE(SUM(duration_ms),0) FROM tracks"
+        "   WHERE album_id=?1 AND missing=0),"
+        " (SELECT COALESCE(SUM(t2.duration_ms),0) FROM tracks t2, tracks t"
+        "   WHERE t.id=?2 AND t2.album_id=?1 AND t2.missing=0"
+        "     AND (t2.disc<t.disc OR (t2.disc=t.disc AND (t2.track<t.track"
+        "          OR (t2.track=t.track AND t2.id<t.id))))),"
+        " (SELECT content_hash FROM tracks WHERE id=?2);";
+    static const char *UPSERT =
+        "INSERT INTO book_progress"
+        " (album_id,track_id,content_hash,pos_ms,percent,finished,current,updated)"
+        " VALUES(?1,?2,?3,?4,?5,?6,?7,?8)"
+        " ON CONFLICT(album_id,track_id) DO UPDATE SET"
+        "   content_hash=COALESCE(excluded.content_hash,content_hash),"
+        "   pos_ms=excluded.pos_ms,"
+        "   percent=excluded.percent,"
+        "   finished=excluded.finished,"
+        "   current=excluded.current,"
+        "   updated=excluded.updated;";
+    static const char *DEMOTE =
+        "UPDATE book_progress SET current=0 "
+        "WHERE album_id=?1 AND track_id<>?2 AND current=1;";
+    sqlite3_stmt *st;
+    int rc = SQLITE_DONE;
+    bool have_row = false, loc_cur = false, loc_fin = false;
+    int64_t loc_upd = 0, cur_upd = 0;
+    double percent = 0.0;
+    int fin, cur;
+    char hash[64];
+    hash[0] = '\0';
+
+    if (out_changed) *out_changed = false;
+    if (!lib || album_id <= 0 || track_id <= 0) return MN_ERR_INVALID;
+    if (lib->read_only) return MN_ERR_STATE;
+    if (pos_ms < 0) pos_ms = 0;
+    if (updated_s < 0) updated_s = 0;
+
+    mn__write_lock(lib);
+
+    st = mn__stmt_get(lib->writer.db, &lib->writer.cache, GET, &rc);
+    if (st) {
+        sqlite3_bind_int64(st, 1, album_id);
+        sqlite3_bind_int64(st, 2, track_id);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            have_row = true;
+            loc_upd  = sqlite3_column_int64(st, 0);
+            loc_cur  = sqlite3_column_int(st, 1) != 0;
+            loc_fin  = sqlite3_column_int(st, 2) != 0;
+        }
+        sqlite3_reset(st);
+    }
+    /* LWW: an existing row that is at least as new wins; nothing written. */
+    if (have_row && loc_upd >= updated_s) {
+        mn__write_unlock(lib);
+        return MN_OK;
+    }
+
+    st = mn__stmt_get(lib->writer.db, &lib->writer.cache, PCT, &rc);
+    if (st) {
+        sqlite3_bind_int64(st, 1, album_id);
+        sqlite3_bind_int64(st, 2, track_id);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            int64_t total  = sqlite3_column_int64(st, 0);
+            int64_t before = sqlite3_column_int64(st, 1);
+            const unsigned char *h = sqlite3_column_text(st, 2);
+            if (h) snprintf(hash, sizeof(hash), "%s", (const char *)h);
+            if (total > 0) {
+                percent = (double)(before + pos_ms) / (double)total;
+                if (percent < 0.0) percent = 0.0;
+                if (percent > 1.0) percent = 1.0;
+            }
+        }
+        sqlite3_reset(st);
+    }
+
+    /* Finished: the peer's latch decision when it sent one (finished there
+     * = finished here; rewind-cleared clears here too); otherwise the local
+     * latch rule over the recomputed percent. */
+    if (has_finished) {
+        fin = finished ? 1 : 0;
+    } else if (percent >= 0.995) {
+        fin = 1;
+    } else if (percent < 0.5) {
+        fin = 0;
+    } else {
+        fin = (have_row && loc_fin) ? 1 : 0;
+    }
+
+    /* Currency: promote only when the record is the peer's live chapter AND
+     * newer than the album's newest current row (ties keep local — two
+     * peers cannot ping-pong the resume target). */
+    cur = (have_row && loc_cur) ? 1 : 0;
+    if (want_current) {
+        st = mn__stmt_get(lib->writer.db, &lib->writer.cache, CURUPD, &rc);
+        if (st) {
+            sqlite3_bind_int64(st, 1, album_id);
+            if (sqlite3_step(st) == SQLITE_ROW)
+                cur_upd = sqlite3_column_int64(st, 0);
+            sqlite3_reset(st);
+        }
+        if (updated_s > cur_upd) cur = 1;
+    }
+
+    st = mn__stmt_get(lib->writer.db, &lib->writer.cache, UPSERT, &rc);
+    if (!st) { mn__write_unlock(lib); return mn__map_sqlite(rc); }
+    sqlite3_bind_int64(st, 1, album_id);
+    sqlite3_bind_int64(st, 2, track_id);
+    if (hash[0]) sqlite3_bind_text(st, 3, hash, -1, SQLITE_TRANSIENT);
+    else         sqlite3_bind_null(st, 3);
+    sqlite3_bind_int64(st, 4, pos_ms);
+    sqlite3_bind_double(st, 5, percent);
+    sqlite3_bind_int64(st, 6, (int64_t)fin);
+    sqlite3_bind_int64(st, 7, (int64_t)cur);
+    sqlite3_bind_int64(st, 8, updated_s);
+    rc = sqlite3_step(st);
+    sqlite3_reset(st);
+    if (rc == SQLITE_DONE && cur && want_current) {
+        /* This row just became (or stayed) the resume target: demote the
+         * album's other rows so the current singleton invariant holds. */
+        st = mn__stmt_get(lib->writer.db, &lib->writer.cache, DEMOTE, &rc);
+        if (st) {
+            sqlite3_bind_int64(st, 1, album_id);
+            sqlite3_bind_int64(st, 2, track_id);
+            rc = sqlite3_step(st);
+            sqlite3_reset(st);
+        }
+    }
+    if (rc != SQLITE_DONE) mn__set_err_db(lib, lib->writer.db);
+    else if (out_changed) *out_changed = true;
+    mn__write_unlock(lib);
+    return mn__map_sqlite(rc);
 }
 
 mn_status mn_library_track_id_by_path(mn_library *lib, const char *path,

@@ -77,6 +77,11 @@
 #include "stems.h"          /* offline stem separation for the export feature */
 #include "audio_write.h"    /* WAV/FLAC/MP3 writers for stem export */
 #include "stempack.h"       /* .mnstem ZIP container writer */
+#include "discover.h"       /* UDP auto-discovery of the phone's sync server */
+#include "devices.h"        /* sync device registry (paired phones/players) */
+#include "control.h"        /* desktop remote-control listener (phone -> PC) */
+#include <wincrypt.h>       /* CryptGenRandom: control-token minting */
+#include "sync.h"           /* raw-bytes transport: file transfer + have-query */
 
 /* Implementation lives in artcache.c; here we only need the declarations. */
 #include "stb_image_write.h"
@@ -559,15 +564,23 @@ static void podusage_build(strbuf *b);
 static void pod_delete_cmd(const char *json, bool whole_feed);
 static void onlinefile_cmd(cef_frame_t *frame, const char *json, bool save);
 static cef_frame_t *sync_grab_frame(void);   /* owned main-frame ref or NULL */
-static void sync_start(cef_frame_t *frame_owned);
+static void sync_start(cef_frame_t *frame_owned, bool auto_run);
 static void syncfile_start(cef_frame_t *frame_owned, bool import,
                            const char *path_or_null);
+static void devices_emit(cef_frame_t *frame_owned, bool scanned);
+static void devices_save_locked(void);      /* call with g_sync_cs held */
+static void devices_apply_active_locked(void);
+static void presence_scan_kick(void);       /* wake the ambient scanner now */
+static void xfer_enqueue_json(cef_frame_t *frame_owned, const char *json);
+static void sendpick_start(cef_frame_t *frame_owned);
+static void presence_start(cef_frame_t *frame_owned);
 static void purgemissing_start(cef_frame_t *frame_owned);
 static void deletetracks_start(cef_frame_t *frame_owned, const char *json);
 static void backupnow_start(cef_frame_t *frame_owned);
 static void reinfer_start(cef_frame_t *frame_owned);
 static void sync_emit_status(cef_frame_t *frame_owned, const char *state,
                              int applied, int skipped, int pushed,
+                             int by_hash, int by_id,
                              const char *error);
 static bool db_backup_rotate(bool force);
 static bool depth_generate_guarded(mn_depth *d, const char *src,
@@ -623,6 +636,11 @@ static CRITICAL_SECTION g_sync_cs;           /* guards host/port/state      */
 static char             g_sync_host[128] = {0};
 static int              g_sync_port = NE_SYNC_DEFAULT_PORT;
 static char             g_sync_state[16] = "idle";  /* last emitted state   */
+/* Per-category tallies of the LAST completed merge (guarded by g_sync_cs;
+ * zeroed when a flow starts) — the "what got synced" summary the status
+ * events carry so the UI can toast it in plain words. The struct comes
+ * from sync.h (included above). */
+static mn_sync_counts   g_sync_counts;
 static volatile LONG    g_sync_auto = 0;     /* auto-sync opt-in            */
 static volatile LONG    g_sync_busy = 0;     /* single-flight guard         */
 static volatile LONG64  g_sync_last_ms = 0;  /* epoch ms of last success    */
@@ -706,6 +724,294 @@ static void sync_state_save_fields(void) {
     }
 }
 
+/* ------------------------------------------------------------------------- */
+/* DEVICE REGISTRY — every phone the user has PAIRED for sync (devices.h).    */
+/* Guarded by g_sync_cs like the rest of the sync state. The active device    */
+/* is mirrored into g_sync_host/g_sync_port so every existing consumer        */
+/* (sync now, auto tick, file transfer, presence pills) keeps working         */
+/* untouched; host.txt keeps being written as that mirror for downgrade       */
+/* compatibility. Persisted as sync\devices.txt.                              */
+/*                                                                            */
+/* Beside the registry sits the FOUND LIST: responders the ambient presence   */
+/* scan heard that are NOT registered. They appear in the panel on their own  */
+/* (same-network devices detect each other automatically) but ADDING one to   */
+/* the registry is always an explicit user click — discovery never writes     */
+/* the registry by itself.                                                    */
+/* ------------------------------------------------------------------------- */
+
+static mn_devreg g_devreg;                       /* guarded by g_sync_cs     */
+
+#define NE_FOUND_MAX      16
+#define NE_FOUND_TTL_MS   (150 * 1000)   /* drop unseen responders after ~5 scans */
+#define NE_ONLINE_MS      (75 * 1000)    /* registry device "online" horizon  */
+
+typedef struct {
+    mn_found_device d;
+    int64_t         seen_ms;
+} ne_found_entry;
+
+static ne_found_entry g_found[NE_FOUND_MAX];     /* guarded by g_sync_cs     */
+static int            g_found_count = 0;
+
+static void devices_save_locked(void) {
+    char path[1500];
+    sync_file_path("devices.txt", path, sizeof(path));
+    (void)mn_devreg_save(&g_devreg, path);
+}
+
+/* Mirror the active device into the legacy g_sync_host/g_sync_port pair
+ * (empty when nothing is selected) and persist the host.txt mirror. */
+static void devices_apply_active_locked(void) {
+    const mn_device *a = mn_devreg_active(&g_devreg);
+    if (a) {
+        snprintf(g_sync_host, sizeof(g_sync_host), "%s", a->host);
+        g_sync_port = a->port;
+    } else {
+        g_sync_host[0] = 0;
+        g_sync_port    = NE_SYNC_DEFAULT_PORT;
+    }
+}
+
+/* Build the {"type":"syncdevices",...} event: the registry (with live
+ * online flags) + the found-but-unregistered list. `scanned` marks emits
+ * that conclude a discovery pass so the UI can settle its spinner. */
+static void devices_json(strbuf *b, bool scanned) {
+    int     i;
+    int64_t now = sync_now_ms();
+    sb_puts(b, "{\"type\":\"syncdevices\",\"active\":");
+    EnterCriticalSection(&g_sync_cs);
+    sb_json_int(b, g_devreg.active_id);
+    sb_puts(b, ",\"devices\":[");
+    for (i = 0; i < g_devreg.count; i++) {
+        const mn_device *d = &g_devreg.dev[i];
+        if (i) sb_putc(b, ',');
+        sb_puts(b, "{\"id\":");      sb_json_int(b, d->id);
+        sb_puts(b, ",\"name\":");    sb_json_str(b, d->name);
+        sb_puts(b, ",\"model\":");   sb_json_str(b, d->model);
+        sb_puts(b, ",\"host\":");    sb_json_str(b, d->host);
+        sb_puts(b, ",\"port\":");    sb_json_int(b, d->port);
+        sb_puts(b, ",\"online\":");
+        sb_json_bool(b, d->last_seen_ms > 0 &&
+                        now - d->last_seen_ms < NE_ONLINE_MS);
+        sb_puts(b, ",\"lastSeen\":");   sb_json_i64(b, d->last_seen_ms);
+        sb_puts(b, ",\"lastSync\":");   sb_json_i64(b, d->last_sync_ms);
+        sb_puts(b, ",\"lastResult\":"); sb_json_str(b, d->last_result);
+        sb_putc(b, '}');
+    }
+    sb_puts(b, "],\"found\":[");
+    for (i = 0; i < g_found_count; i++) {
+        const ne_found_entry *e = &g_found[i];
+        if (i) sb_putc(b, ',');
+        sb_puts(b, "{\"host\":");    sb_json_str(b, e->d.host);
+        sb_puts(b, ",\"port\":");    sb_json_int(b, e->d.port);
+        sb_puts(b, ",\"model\":");   sb_json_str(b, e->d.model);
+        sb_puts(b, ",\"lastSeen\":");sb_json_i64(b, e->seen_ms);
+        sb_putc(b, '}');
+    }
+    LeaveCriticalSection(&g_sync_cs);
+    sb_puts(b, "],\"scan\":");
+    sb_json_bool(b, scanned);
+    sb_putc(b, '}');
+}
+
+/* Emit the devices event to `frame_owned` (consumes the ref; NULL = no-op). */
+static void devices_emit(cef_frame_t *frame_owned, bool scanned) {
+    strbuf b;
+    if (!frame_owned) return;
+    sb_init(&b);
+    devices_json(&b, scanned);
+    if (!b.oom) {
+        post_emit_owned(frame_owned, b.data);
+    } else {
+        sb_free(&b);
+        frame_owned->base.release(&frame_owned->base);
+    }
+}
+
+/*
+ * Fold one discovery pass into the registry + found list (g_sync_cs held).
+ * For each responder:
+ *   1. exact host:port match on a registry device  -> stamp last_seen,
+ *      backfill a missing model (a manually-added IP learns what it is).
+ *   2. host match on ANOTHER port                  -> same device, the app
+ *      changed its port setting: follow it (log line).
+ *   3. no host match, but the model matches EXACTLY ONE registry device
+ *      whose current host answered nothing         -> DHCP drift: the same
+ *      registered device came back with a new lease. Auto-apply the new
+ *      address with a log line. (The registration was the user's consent
+ *      for this device identity; the IP is transport detail — silently
+ *      following it is what keeps unattended auto-sync alive. Ambiguous
+ *      model matches — two identical phones — are left alone.)
+ *   4. otherwise                                   -> unregistered: goes in
+ *      the found list for the panel. NEVER auto-added to the registry.
+ * Returns true when any registry field changed (caller saves + re-mirrors).
+ */
+/* ------------------------------------------------------------------------- */
+/* SYNC ACTIVITY LOG — one JSON object per line, appended to                  */
+/* sync\activity.jsonl (rotated to activity.1.jsonl past ~1.5 MB so it can    */
+/* never eat the disk). Every sync-related event lands here: device           */
+/* seen/lost/moved, registry add/rename/remove/select, every sync attempt     */
+/* with per-category counts + duration + outcome. Structured on purpose:      */
+/* grep-able for debugging, parseable for the panel's Activity view           */
+/* ({"cmd":"synclog"} returns the tail). Callers pass the line BODY           */
+/* (everything after the ts field, already JSON-escaped via sb_json_str).     */
+/* ------------------------------------------------------------------------- */
+
+#define NE_SYNCLOG_ROTATE_BYTES (1536 * 1024)
+
+static void synclog_write(const char *body) {
+    char  path[1500], old[1500];
+    FILE *f;
+    if (!body || !body[0]) return;
+    sync_file_path("activity.jsonl", path, sizeof(path));
+    /* rotation check: cheap stat via fopen+fseek only on append handle */
+    f = fopen(path, "ab");
+    if (!f) return;
+    if (fseek(f, 0, SEEK_END) == 0 && ftell(f) > NE_SYNCLOG_ROTATE_BYTES) {
+        fclose(f);
+        sync_file_path("activity.1.jsonl", old, sizeof(old));
+        remove(old);
+        rename(path, old);
+        f = fopen(path, "ab");
+        if (!f) return;
+    }
+    fprintf(f, "{\"ts\":%lld,%s}\n", (long long)sync_now_ms(), body);
+    fclose(f);
+}
+
+/* Log one event whose only payload is a device name: "ev":"<ev>","dev":.. */
+static void synclog_dev(const char *ev, const char *name, const char *extra) {
+    strbuf b;
+    sb_init(&b);
+    sb_puts(&b, "\"ev\":\"");
+    sb_puts(&b, ev);
+    sb_puts(&b, "\",\"dev\":");
+    sb_json_str(&b, name ? name : "");
+    if (extra && extra[0]) {
+        sb_putc(&b, ',');
+        sb_puts(&b, extra);
+    }
+    if (!b.oom) synclog_write(b.data);
+    sb_free(&b);
+}
+
+static bool devices_fold_scan_locked(const mn_found_device *f, int nf) {
+    bool    changed = false;
+    int64_t now = sync_now_ms();
+    int     i, j;
+
+    for (i = 0; i < nf; i++) {
+        mn_device *d = mn_devreg_find_host(&g_devreg, f[i].host, f[i].port);
+
+        if (!d) {
+            /* host answered on a different port than registered? */
+            for (j = 0; j < g_devreg.count; j++) {
+                if (strcmp(g_devreg.dev[j].host, f[i].host) == 0) {
+                    char extra[128];
+                    d = &g_devreg.dev[j];
+                    fprintf(stderr, "[sync] device \"%s\" moved port %d -> %d\n",
+                            d->name, d->port, f[i].port);
+                    snprintf(extra, sizeof(extra),
+                             "\"from\":\"%s:%d\",\"to\":\"%s:%d\"",
+                             d->host, d->port, f[i].host, f[i].port);
+                    synclog_dev("moved", d->name, extra);
+                    d->port = f[i].port;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if (!d && f[i].model[0]) {
+            /* DHCP drift: unique model match among devices that did NOT
+             * answer at their recorded host this pass */
+            mn_device *cand = NULL;
+            int        matches = 0;
+            for (j = 0; j < g_devreg.count; j++) {
+                if (strcmp(g_devreg.dev[j].model, f[i].model) != 0) continue;
+                matches++;
+                cand = &g_devreg.dev[j];
+            }
+            if (matches == 1 && cand) {
+                int k, answered = 0;
+                for (k = 0; k < nf; k++) {
+                    if (strcmp(cand->host, f[k].host) == 0) { answered = 1; break; }
+                }
+                if (!answered) {
+                    char extra[128];
+                    fprintf(stderr,
+                            "[sync] device \"%s\" (%s) moved %s -> %s (DHCP)\n",
+                            cand->name, cand->model, cand->host, f[i].host);
+                    snprintf(extra, sizeof(extra),
+                             "\"from\":\"%s:%d\",\"to\":\"%s:%d\",\"why\":\"dhcp\"",
+                             cand->host, cand->port, f[i].host, f[i].port);
+                    synclog_dev("moved", cand->name, extra);
+                    mn_devreg_set_text(cand->host, sizeof(cand->host), f[i].host);
+                    cand->port = f[i].port;
+                    d = cand;
+                    changed = true;
+                }
+            }
+        }
+
+        if (d) {
+            d->last_seen_ms = now;
+            if (f[i].model[0] && strcmp(d->model, f[i].model) != 0) {
+                mn_devreg_set_text(d->model, sizeof(d->model), f[i].model);
+                changed = true;
+            }
+            continue;
+        }
+
+        /* unregistered responder -> found list (update-or-append) */
+        for (j = 0; j < g_found_count; j++) {
+            if (strcmp(g_found[j].d.host, f[i].host) == 0) break;
+        }
+        if (j == g_found_count) {
+            char extra[112];
+            if (g_found_count >= NE_FOUND_MAX) continue;
+            g_found_count++;
+            /* first sighting of an unregistered device — log the offer
+             * (adding remains a user click, this is just visibility) */
+            snprintf(extra, sizeof(extra), "\"host\":\"%s:%d\"",
+                     f[i].host, f[i].port);
+            synclog_dev("found", f[i].model[0] ? f[i].model : f[i].host,
+                        extra);
+        }
+        g_found[j].d       = f[i];
+        g_found[j].seen_ms = now;
+    }
+
+    /* edge-triggered presence transitions for REGISTERED devices: log the
+     * moment a device crosses the online horizon in either direction */
+    for (i = 0; i < g_devreg.count; i++) {
+        mn_device *d = &g_devreg.dev[i];
+        int online_now = d->last_seen_ms > 0 &&
+                         now - d->last_seen_ms < NE_ONLINE_MS;
+        if (online_now != d->was_online) {
+            char extra[96];
+            snprintf(extra, sizeof(extra), "\"host\":\"%s:%d\"",
+                     d->host, d->port);
+            synclog_dev(online_now ? "seen" : "lost", d->name, extra);
+            d->was_online = online_now;
+        }
+    }
+
+    /* expire found-list entries that stopped answering (left the network,
+     * or were just registered — registered hosts fold into branch 1) */
+    for (i = 0; i < g_found_count; ) {
+        bool reg = mn_devreg_find_host(&g_devreg, g_found[i].d.host,
+                                       g_found[i].d.port) != NULL;
+        if (reg || now - g_found[i].seen_ms > NE_FOUND_TTL_MS) {
+            memmove(&g_found[i], &g_found[i + 1],
+                    (size_t)(g_found_count - i - 1) * sizeof(g_found[0]));
+            g_found_count--;
+        } else {
+            i++;
+        }
+    }
+    return changed;
+}
+
 /* Replay the persisted host/auto/last state. Called once at startup (after
  * setup_webroot resolves g_data_dir, before any worker can race it). */
 static void sync_state_load(void) {
@@ -765,22 +1071,61 @@ static void sync_state_load(void) {
         fclose(f);
     }
     sync_fields_apply_to_app();
+
+    /* DEVICE REGISTRY (devices.txt) + one-time MIGRATION of the legacy
+     * single-host setting: a pre-registry install had exactly host.txt —
+     * that host becomes the first (and active) registry entry, so whatever
+     * the user had configured keeps working verbatim. Startup is still
+     * single-threaded here, but the CS exists — hold it for consistency. */
+    EnterCriticalSection(&g_sync_cs);
+    sync_file_path("devices.txt", path, sizeof(path));
+    if (!mn_devreg_load(&g_devreg, path)) mn_devreg_init(&g_devreg);
+    if (g_devreg.count == 0 && g_sync_host[0]) {
+        char legacy[128];
+        snprintf(legacy, sizeof(legacy), "%s", g_sync_host);
+        if (mn_devreg_add(&g_devreg, "My phone", "", legacy, g_sync_port)) {
+            char extra[112];
+            fprintf(stderr, "[sync] migrated legacy host %s:%d into the "
+                    "device registry\n", legacy, g_sync_port);
+            snprintf(extra, sizeof(extra), "\"host\":\"%s:%d\"",
+                     legacy, g_sync_port);
+            synclog_dev("migrated", "My phone", extra);
+            devices_save_locked();
+        }
+    }
+    devices_apply_active_locked();   /* registry is authoritative from here */
+    LeaveCriticalSection(&g_sync_cs);
+    sync_state_save_host();          /* keep the host.txt mirror coherent
+                                        (takes g_sync_cs itself) */
 }
 
-/* Build the {"type":"sync",...} status event (the exact UI contract). */
+/* Build the {"type":"sync",...} status event (the exact UI contract).
+ * byHash/byId split the locally matched remote records by match path
+ * (content fingerprint vs tag identity) so the UI can show the
+ * fingerprint channel working; both 0 outside a live merge. */
 static void sync_status_json(strbuf *b, const char *state,
                              int applied, int skipped, int pushed,
+                             int by_hash, int by_id,
                              const char *error) {
     char hostport[160] = {0};
+    char devname[64]   = {0};
+    mn_sync_counts ct;
     EnterCriticalSection(&g_sync_cs);
     if (g_sync_host[0]) {
         snprintf(hostport, sizeof(hostport), "%s:%d", g_sync_host, g_sync_port);
     }
+    {
+        const mn_device *a = mn_devreg_active(&g_devreg);
+        if (a) snprintf(devname, sizeof(devname), "%s", a->name);
+    }
+    ct = g_sync_counts;
     LeaveCriticalSection(&g_sync_cs);
     sb_puts(b, "{\"type\":\"sync\",\"state\":");
     sb_json_str(b, state);
     sb_puts(b, ",\"host\":");
     sb_json_str(b, hostport);
+    sb_puts(b, ",\"device\":");
+    sb_json_str(b, devname);
     sb_puts(b, ",\"auto\":");
     sb_json_bool(b, InterlockedCompareExchange(&g_sync_auto, 0, 0) != 0);
     sb_puts(b, ",\"last_ms\":");
@@ -791,6 +1136,10 @@ static void sync_status_json(strbuf *b, const char *state,
     sb_json_int(b, skipped);
     sb_puts(b, ",\"pushed\":");
     sb_json_int(b, pushed);
+    sb_puts(b, ",\"byHash\":");
+    sb_json_int(b, by_hash);
+    sb_puts(b, ",\"byId\":");
+    sb_json_int(b, by_id);
     /* per-field toggles + auto interval so the settings UI can populate */
     {
         LONG m = InterlockedCompareExchange(&g_sync_fields, 0, 0);
@@ -800,6 +1149,13 @@ static void sync_status_json(strbuf *b, const char *state,
         sb_puts(b, ",\"interval\":");
         sb_json_int(b, (int)InterlockedCompareExchange(&g_sync_interval_min, 0, 0));
     }
+    /* per-category tallies of the last completed merge ("what got synced") */
+    sb_puts(b, ",\"c_likes\":");    sb_json_int(b, ct.likes);
+    sb_puts(b, ",\"c_dislikes\":"); sb_json_int(b, ct.dislikes);
+    sb_puts(b, ",\"c_cleared\":");  sb_json_int(b, ct.cleared);
+    sb_puts(b, ",\"c_ratings\":");  sb_json_int(b, ct.ratings);
+    sb_puts(b, ",\"c_plays\":");    sb_json_int(b, ct.plays);
+    sb_puts(b, ",\"c_books\":");    sb_json_int(b, ct.books);
     sb_puts(b, ",\"error\":");
     sb_json_str(b, error ? error : "");
     sb_putc(b, '}');
@@ -2105,6 +2461,29 @@ static void emit_to_frame(cef_frame_t *frame, const char *json) {
     frame->execute_java_script(frame, &code, &url, 0);
     cef_string_clear(&code);
     sb_free(&js);
+}
+
+/* Reply the current sync status snapshot to `frame` (non-consuming) — the
+ * shared tail of every sync-settings mutation handler. */
+static void sync_status_reply(cef_frame_t *frame) {
+    char   state[16];
+    strbuf b;
+    EnterCriticalSection(&g_sync_cs);
+    snprintf(state, sizeof(state), "%s", g_sync_state);
+    LeaveCriticalSection(&g_sync_cs);
+    sb_init(&b);
+    sync_status_json(&b, state, 0, 0, 0, 0, 0, "");
+    if (!b.oom) emit_to_frame(frame, b.data);
+    sb_free(&b);
+}
+
+/* Reply the device registry + found list to `frame` (non-consuming). */
+static void devices_reply(cef_frame_t *frame, bool scanned) {
+    strbuf b;
+    sb_init(&b);
+    devices_json(&b, scanned);
+    if (!b.oom) emit_to_frame(frame, b.data);
+    sb_free(&b);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -3442,37 +3821,225 @@ static void dispatch_command(cef_frame_t *frame, const char *json) {
         snprintf(state, sizeof(state), "%s", g_sync_state);
         LeaveCriticalSection(&g_sync_cs);
         strbuf b; sb_init(&b);
-        sync_status_json(&b, state, 0, 0, 0, "");
+        sync_status_json(&b, state, 0, 0, 0, 0, 0, "");
         if (!b.oom) emit_to_frame(frame, b.data);
         sb_free(&b);
     } else if (strcmp(cmd, "syncsethost") == 0) {
-        /* {"cmd":"syncsethost","host":"192.168.1.42","port":8797} —
-         * persist to sync\host.txt ("host|port"), then re-emit status. */
-        char raw[160] = {0}, host[128];
+        /* LEGACY alias (pre-registry contract): now adds-or-finds a registry
+         * entry for host:port and selects it, so any old caller keeps
+         * working and lands in the same registry as everything else. */
+        char host[64] = {0};
         int  port = (int)json_get_i64(json, "port", NE_SYNC_DEFAULT_PORT);
-        size_t j = 0;
-        (void)json_get_str(json, "host", raw, sizeof(raw));
-        /* keep printable chars only; '|' is the persist separator */
-        for (const char *p = raw; *p && j + 1 < sizeof(host); ++p) {
-            if ((unsigned char)*p > 0x20 && *p != '|') host[j++] = *p;
-        }
-        host[j] = 0;
+        mn_device *d;
+        (void)json_get_str(json, "host", host, sizeof(host));
         EnterCriticalSection(&g_sync_cs);
-        snprintf(g_sync_host, sizeof(g_sync_host), "%s", host);
-        g_sync_port = (port > 0 && port <= 65535) ? port
-                                                  : NE_SYNC_DEFAULT_PORT;
+        d = mn_devreg_add(&g_devreg, "", "", host, port);
+        if (d) {
+            g_devreg.active_id = d->id;
+            devices_save_locked();
+            devices_apply_active_locked();
+        }
         LeaveCriticalSection(&g_sync_cs);
         sync_state_save_host();
-        {
-            char state[16];
-            EnterCriticalSection(&g_sync_cs);
-            snprintf(state, sizeof(state), "%s", g_sync_state);
-            LeaveCriticalSection(&g_sync_cs);
-            strbuf b; sb_init(&b);
-            sync_status_json(&b, state, 0, 0, 0, "");
-            if (!b.oom) emit_to_frame(frame, b.data);
-            sb_free(&b);
+        devices_reply(frame, false);
+        sync_status_reply(frame);
+    } else if (strcmp(cmd, "syncdevices") == 0) {
+        /* Registry + found-list snapshot (cheap, straight from cache). */
+        devices_reply(frame, false);
+    } else if (strcmp(cmd, "synclog") == 0) {
+        /* Tail of the sync activity log — reply {"type":"synclog",
+         * "lines":[{...},...]} oldest-first (the UI reverses). Both the
+         * read and the render are capped at 300 entries, so the work
+         * stays bounded no matter how large the file has grown (the
+         * writer rotates it at ~1.5 MB anyway). Lines are our own JSON
+         * objects and embed raw. */
+        char   path[1500];
+        FILE  *lf;
+        strbuf b;
+        sb_init(&b);
+        sb_puts(&b, "{\"type\":\"synclog\",\"lines\":[");
+        sync_file_path("activity.jsonl", path, sizeof(path));
+        lf = fopen(path, "rb");
+        if (lf) {
+            char  *buf = NULL;
+            long   sz  = 0;
+            if (fseek(lf, 0, SEEK_END) == 0 && (sz = ftell(lf)) > 0 &&
+                fseek(lf, 0, SEEK_SET) == 0 &&
+                (buf = (char *)malloc((size_t)sz + 1)) != NULL) {
+                size_t got = fread(buf, 1, (size_t)sz, lf);
+                buf[got] = 0;
+                {
+                    /* collect line starts, keep the last 300 */
+                    enum { CAP = 300 };
+                    static char *starts[CAP];   /* dispatch is single-threaded */
+                    int    n = 0, dropped = 0, k;
+                    char  *p = buf;
+                    while (*p) {
+                        char *nl = strchr(p, '\n');
+                        if (p[0] == '{') {
+                            if (n == CAP) {
+                                memmove(starts, starts + 1,
+                                        (CAP - 1) * sizeof(char *));
+                                n = CAP - 1;
+                                dropped = 1;
+                            }
+                            starts[n++] = p;
+                        }
+                        if (!nl) break;
+                        *nl = 0;
+                        p = nl + 1;
+                    }
+                    int first = 1;
+                    (void)dropped;
+                    for (k = 0; k < n; k++) {
+                        size_t ln = strlen(starts[k]);
+                        while (ln > 0 &&
+                               (unsigned char)starts[k][ln - 1] <= 0x20)
+                            starts[k][--ln] = 0;
+                        /* torn/partial tail line (crash mid-write): skip */
+                        if (ln < 2 || starts[k][ln - 1] != '}') continue;
+                        if (!first) sb_putc(&b, ',');
+                        first = 0;
+                        sb_puts(&b, starts[k]);
+                    }
+                }
+            }
+            free(buf);
+            fclose(lf);
         }
+        sb_puts(&b, "]}");
+        if (!b.oom) emit_to_frame(frame, b.data);
+        sb_free(&b);
+    } else if (strcmp(cmd, "syncdevadd") == 0) {
+        /* {"cmd":"syncdevadd","host":"10.0.0.7","port":8797[,"name":"…",
+         *  "model":"…"]} — the ONLY way a device enters the registry: an
+         * explicit user click (discovery list "Add" or the by-address
+         * form). Discovery itself NEVER writes the registry. */
+        char host[64] = {0}, name[64] = {0}, model[64] = {0};
+        int  port = (int)json_get_i64(json, "port", NE_SYNC_DEFAULT_PORT);
+        char added[64] = {0}, extra[112];
+        (void)json_get_str(json, "host",  host,  sizeof(host));
+        (void)json_get_str(json, "name",  name,  sizeof(name));
+        (void)json_get_str(json, "model", model, sizeof(model));
+        EnterCriticalSection(&g_sync_cs);
+        {
+            mn_device *d = mn_devreg_add(&g_devreg, name, model, host, port);
+            if (d) {
+                snprintf(added, sizeof(added), "%s", d->name);
+                snprintf(extra, sizeof(extra), "\"host\":\"%s:%d\"",
+                         d->host, d->port);
+                devices_save_locked();
+                devices_apply_active_locked();
+            }
+        }
+        LeaveCriticalSection(&g_sync_cs);
+        if (added[0]) synclog_dev("added", added, extra);
+        sync_state_save_host();
+        devices_reply(frame, false);
+        sync_status_reply(frame);
+        presence_scan_kick();   /* fresh online flag without the 30 s wait */
+    } else if (strcmp(cmd, "syncdevselect") == 0) {
+        /* {"cmd":"syncdevselect","id":N} — the active device is what every
+         * sync action targets (sync now / auto / transfers / presence). */
+        int  id = (int)json_get_i64(json, "id", 0);
+        char sel[64] = {0};
+        EnterCriticalSection(&g_sync_cs);
+        {
+            const mn_device *d = mn_devreg_find(&g_devreg, id);
+            if (d) {
+                snprintf(sel, sizeof(sel), "%s", d->name);
+                g_devreg.active_id = id;
+                devices_save_locked();
+                devices_apply_active_locked();
+            }
+        }
+        LeaveCriticalSection(&g_sync_cs);
+        if (sel[0]) synclog_dev("selected", sel, NULL);
+        sync_state_save_host();
+        devices_reply(frame, false);
+        sync_status_reply(frame);
+    } else if (strcmp(cmd, "syncdevrename") == 0) {
+        /* {"cmd":"syncdevrename","id":N,"name":"…"} — inline rename. */
+        char name[64] = {0};
+        int  id = (int)json_get_i64(json, "id", 0);
+        mn_device *d;
+        char oldname[64] = {0}, newname[64] = {0};
+        (void)json_get_str(json, "name", name, sizeof(name));
+        EnterCriticalSection(&g_sync_cs);
+        d = mn_devreg_find(&g_devreg, id);
+        if (d && name[0]) {
+            snprintf(oldname, sizeof(oldname), "%s", d->name);
+            mn_devreg_set_text(d->name, sizeof(d->name), name);
+            if (!d->name[0])   /* sanitized away entirely: keep something */
+                snprintf(d->name, sizeof(d->name), "%s",
+                         d->model[0] ? d->model : d->host);
+            snprintf(newname, sizeof(newname), "%s", d->name);
+            devices_save_locked();
+        }
+        LeaveCriticalSection(&g_sync_cs);
+        if (newname[0] && strcmp(oldname, newname) != 0) {
+            strbuf lb;
+            sb_init(&lb);
+            sb_puts(&lb, "\"ev\":\"renamed\",\"dev\":");
+            sb_json_str(&lb, newname);
+            sb_puts(&lb, ",\"from\":");
+            sb_json_str(&lb, oldname);
+            if (!lb.oom) synclog_write(lb.data);
+            sb_free(&lb);
+        }
+        devices_reply(frame, false);
+        sync_status_reply(frame);
+    } else if (strcmp(cmd, "syncdevupdate") == 0) {
+        /* {"cmd":"syncdevupdate","id":N,"host":"…","port":P} — manual
+         * address correction for an already-registered device. */
+        char host[64] = {0};
+        int  id   = (int)json_get_i64(json, "id", 0);
+        int  port = (int)json_get_i64(json, "port", NE_SYNC_DEFAULT_PORT);
+        mn_device *d;
+        char upd[64] = {0}, extra[144];
+        (void)json_get_str(json, "host", host, sizeof(host));
+        EnterCriticalSection(&g_sync_cs);
+        d = mn_devreg_find(&g_devreg, id);
+        if (d && host[0]) {
+            snprintf(upd, sizeof(upd), "%s", d->name);
+            snprintf(extra, sizeof(extra),
+                     "\"from\":\"%s:%d\",\"to\":\"%s:%d\",\"why\":\"manual\"",
+                     d->host, d->port, host,
+                     (port > 0 && port <= 65535) ? port : NE_SYNC_DEFAULT_PORT);
+            mn_devreg_set_text(d->host, sizeof(d->host), host);
+            d->port = (port > 0 && port <= 65535) ? port
+                                                  : NE_SYNC_DEFAULT_PORT;
+            devices_save_locked();
+            devices_apply_active_locked();
+        }
+        LeaveCriticalSection(&g_sync_cs);
+        if (upd[0]) synclog_dev("moved", upd, extra);
+        sync_state_save_host();
+        devices_reply(frame, false);
+        sync_status_reply(frame);
+        presence_scan_kick();
+    } else if (strcmp(cmd, "syncdevremove") == 0) {
+        /* {"cmd":"syncdevremove","id":N} — the UI confirms before sending.
+         * Removing the active device leaves NOTHING selected (never a
+         * silent fallback to some other phone). */
+        int  id = (int)json_get_i64(json, "id", 0);
+        char gone[64] = {0};
+        EnterCriticalSection(&g_sync_cs);
+        {
+            const mn_device *d = mn_devreg_find(&g_devreg, id);
+            if (d) snprintf(gone, sizeof(gone), "%s", d->name);
+        }
+        if (mn_devreg_remove(&g_devreg, id)) {
+            devices_save_locked();
+            devices_apply_active_locked();
+        } else {
+            gone[0] = 0;
+        }
+        LeaveCriticalSection(&g_sync_cs);
+        if (gone[0]) synclog_dev("removed", gone, NULL);
+        sync_state_save_host();
+        devices_reply(frame, false);
+        sync_status_reply(frame);
     } else if (strcmp(cmd, "syncauto") == 0) {
         /* {"cmd":"syncauto","on":bool[,"minutes":N]} — persisted; the
          * 5-minute heal tick runs the flow when on + host set + last
@@ -3492,7 +4059,7 @@ static void dispatch_command(cef_frame_t *frame, const char *json) {
             snprintf(state, sizeof(state), "%s", g_sync_state);
             LeaveCriticalSection(&g_sync_cs);
             strbuf b; sb_init(&b);
-            sync_status_json(&b, state, 0, 0, 0, "");
+            sync_status_json(&b, state, 0, 0, 0, 0, 0, "");
             if (!b.oom) emit_to_frame(frame, b.data);
             sb_free(&b);
         }
@@ -3512,7 +4079,7 @@ static void dispatch_command(cef_frame_t *frame, const char *json) {
             snprintf(state, sizeof(state), "%s", g_sync_state);
             LeaveCriticalSection(&g_sync_cs);
             strbuf b; sb_init(&b);
-            sync_status_json(&b, state, 0, 0, 0, "");
+            sync_status_json(&b, state, 0, 0, 0, 0, 0, "");
             if (!b.oom) emit_to_frame(frame, b.data);
             sb_free(&b);
         }
@@ -3521,7 +4088,7 @@ static void dispatch_command(cef_frame_t *frame, const char *json) {
          * seconds, WORKER thread; progress arrives as {"type":"sync",...}
          * events per state change (single-flight). */
         frame->base.add_ref(&frame->base);
-        sync_start(frame);
+        sync_start(frame, false);
     } else if (strcmp(cmd, "syncexport") == 0) {
         /* Snapshot -> sync\nexgen_library_sync.json (or a given path). */
         char path[1024] = {0};
@@ -3534,6 +4101,30 @@ static void dispatch_command(cef_frame_t *frame, const char *json) {
         (void)json_get_str(json, "path", path, sizeof(path));
         frame->base.add_ref(&frame->base);
         syncfile_start(frame, true, path[0] ? path : NULL);
+    } else if (strcmp(cmd, "syncdiscover") == 0) {
+        /* "Find devices": force an immediate discovery pass. The ambient
+         * presence thread runs the scan and emits {"type":"syncdevices",
+         * "scan":true,...} when its ~3 s window closes. */
+        presence_scan_kick();
+    } else if (strcmp(cmd, "sendfiles") == 0) {
+        /* {"cmd":"sendfiles","paths":["C:\\...",...]} — queue the files for
+         * wireless upload to the phone (POST /sync/file). Uploads run
+         * sequentially on ONE worker; progress streams as
+         * {"type":"xfer","state":"start|progress|done|error",...} events. */
+        frame->base.add_ref(&frame->base);
+        xfer_enqueue_json(frame, json);
+    } else if (strcmp(cmd, "sendpick") == 0) {
+        /* Native multi-select audio-file picker (the drag-drop fallback) —
+         * chosen files feed the same transfer queue. Dialog blocks: WORKER. */
+        frame->base.add_ref(&frame->base);
+        sendpick_start(frame);
+    } else if (strcmp(cmd, "syncpresence") == 0) {
+        /* "On phone?" probe: ask the phone which of our fingerprinted
+         * tracks it has (GET /sync/have, batched). Network — WORKER
+         * (reply: {"type":"presence","ok":bool,"have":[hashes],
+         * "ids":[track ids]}; ok:false = phone unreachable, keep quiet). */
+        frame->base.add_ref(&frame->base);
+        presence_start(frame);
     } else if (strcmp(cmd, "waveform") == 0) {
         waveform_and_reply(frame, json_get_i64(json, "id", 0));
     } else if (strcmp(cmd, "settings") == 0) {
@@ -5142,6 +5733,7 @@ static void artfetch_start(cef_frame_t *frame_owned, const char *artist,
  * records `state` so a later {"cmd":"syncstatus"} reflects it. */
 static void sync_emit_status(cef_frame_t *frame_owned, const char *state,
                              int applied, int skipped, int pushed,
+                             int by_hash, int by_id,
                              const char *error) {
     strbuf b;
     EnterCriticalSection(&g_sync_cs);
@@ -5149,7 +5741,8 @@ static void sync_emit_status(cef_frame_t *frame_owned, const char *state,
     LeaveCriticalSection(&g_sync_cs);
     if (!frame_owned) return;
     sb_init(&b);
-    sync_status_json(&b, state, applied, skipped, pushed, error);
+    sync_status_json(&b, state, applied, skipped, pushed, by_hash, by_id,
+                     error);
     if (!b.oom) {
         post_emit_owned(frame_owned, b.data);   /* hands off b.data */
     } else {
@@ -5162,32 +5755,149 @@ typedef struct {
     cef_frame_t *frame;      /* owned ref; may be NULL (headless auto sync) */
     char         host[128];
     int          port;
+    int          dev_id;     /* registry id of the target (0 = none)       */
+    bool         auto_run;   /* true when the background tick fired this   */
+    int64_t      start_ms;   /* flow start (activity-log duration)         */
+    mn_sync_counts counts;   /* per-category local merge tallies           */
+    char         last_error[96];   /* last "error" message seen             */
 } ne_sync_ctx;
 
 /* Progress relay from mn_app_sync_run (worker thread): every state change
  * emits the status contract; "done" stamps + persists last_ms first so the
- * event already carries it. */
+ * event already carries it. done/error also land on the target device's
+ * registry row (last_sync/last_result) so the panel history is honest. */
 static void sync_progress_cb(void *user, const char *state,
                              int applied, int skipped, int pushed,
+                             int by_hash, int by_id,
                              const char *error) {
     ne_sync_ctx *ctx = (ne_sync_ctx *)user;
-    if (strcmp(state, "done") == 0) {
+    bool done = strcmp(state, "done")  == 0;
+    bool err  = strcmp(state, "error") == 0;
+    if (done) {
         InterlockedExchange64(&g_sync_last_ms, sync_now_ms());
         sync_state_save_last();
+    }
+    if (err) {
+        snprintf(ctx->last_error, sizeof(ctx->last_error), "%s",
+                 error ? error : "failed");
+    }
+    if (done || err) {
+        char devname[64] = {0};
+        EnterCriticalSection(&g_sync_cs);
+        /* the done event must already carry the per-category tallies */
+        if (done) g_sync_counts = ctx->counts;
+        if (ctx->dev_id > 0) {
+            mn_device *d = mn_devreg_find(&g_devreg, ctx->dev_id);
+            if (d) {
+                snprintf(devname, sizeof(devname), "%s", d->name);
+                if (done) {
+                    d->last_sync_ms = sync_now_ms();
+                    snprintf(d->last_result, sizeof(d->last_result),
+                             "ok — %d applied, %d pushed", applied, pushed);
+                } else {
+                    mn_devreg_set_text(d->last_result, sizeof(d->last_result),
+                                       error && error[0] ? error : "failed");
+                }
+                devices_save_locked();
+            }
+        }
+        LeaveCriticalSection(&g_sync_cs);
+
+        /* ACTIVITY LOG: the full story of this attempt — device, mode,
+         * outcome, per-category pulled counts, pushed aggregate (what the
+         * phone reported applying from our snapshot), duration. */
+        {
+            strbuf lb;
+            sb_init(&lb);
+            sb_puts(&lb, "\"ev\":\"sync\",\"dev\":");
+            sb_json_str(&lb, devname[0] ? devname : ctx->host);
+            sb_puts(&lb, ",\"host\":");
+            sb_json_str(&lb, ctx->host);
+            sb_puts(&lb, ",\"mode\":\"");
+            sb_puts(&lb, ctx->auto_run ? "auto" : "manual");
+            sb_puts(&lb, "\",\"ok\":");
+            sb_json_bool(&lb, done);
+            if (done) {
+                sb_puts(&lb, ",\"applied\":");  sb_json_int(&lb, applied);
+                sb_puts(&lb, ",\"skipped\":");  sb_json_int(&lb, skipped);
+                sb_puts(&lb, ",\"pushed\":");   sb_json_int(&lb, pushed);
+                sb_puts(&lb, ",\"likes\":");    sb_json_int(&lb, ctx->counts.likes);
+                sb_puts(&lb, ",\"dislikes\":"); sb_json_int(&lb, ctx->counts.dislikes);
+                sb_puts(&lb, ",\"cleared\":");  sb_json_int(&lb, ctx->counts.cleared);
+                sb_puts(&lb, ",\"ratings\":");  sb_json_int(&lb, ctx->counts.ratings);
+                sb_puts(&lb, ",\"plays\":");    sb_json_int(&lb, ctx->counts.plays);
+                sb_puts(&lb, ",\"books\":");    sb_json_int(&lb, ctx->counts.books);
+                sb_puts(&lb, ",\"byHash\":");   sb_json_int(&lb, by_hash);
+                sb_puts(&lb, ",\"byId\":");     sb_json_int(&lb, by_id);
+            } else {
+                sb_puts(&lb, ",\"error\":");
+                sb_json_str(&lb, error ? error : "");
+            }
+            sb_puts(&lb, ",\"dur_ms\":");
+            sb_json_i64(&lb, sync_now_ms() - ctx->start_ms);
+            if (!lb.oom) synclog_write(lb.data);
+            sb_free(&lb);
+        }
+        devices_emit(sync_grab_frame(), false);
     }
     if (ctx->frame) {
         /* sync_emit_status consumes a ref; keep the baseline one alive. */
         ctx->frame->base.add_ref(&ctx->frame->base);
-        sync_emit_status(ctx->frame, state, applied, skipped, pushed, error);
+        sync_emit_status(ctx->frame, state, applied, skipped, pushed,
+                         by_hash, by_id, error);
     } else {
-        sync_emit_status(NULL, state, applied, skipped, pushed, error);
+        sync_emit_status(NULL, state, applied, skipped, pushed,
+                         by_hash, by_id, error);
     }
 }
 
 static DWORD WINAPI sync_thread(LPVOID param) {
     worker_enter();
     ne_sync_ctx *ctx = (ne_sync_ctx *)param;
-    (void)mn_app_sync_run(g_app, ctx->host, ctx->port, sync_progress_cb, ctx);
+    bool ok = mn_app_sync_run(g_app, ctx->host, ctx->port, &ctx->counts,
+                              sync_progress_cb, ctx);
+
+    /* DHCP-DRIFT RECOVERY for the interactive path: the ambient presence
+     * scan follows address changes on its own every ~30 s, but a "Sync
+     * now" fired against a just-expired lease shouldn't fail dumb. When
+     * the target was simply unreachable, run one discovery pass right
+     * here; if it relocates the SAME registered device (model identity,
+     * see devices_fold_scan_locked) to a new address, retry once. */
+    if (!ok && ctx->dev_id > 0 &&
+        strstr(ctx->last_error, "unreachable") != NULL &&
+        InterlockedCompareExchange(&g_shutting_down, 0, 0) == 0) {
+        mn_found_device f[NE_FOUND_MAX];
+        int  nf = mn_discover_scan(f, NE_FOUND_MAX, 2500);
+        char nhost[128] = {0};
+        int  nport = 0;
+        if (nf > 0) {
+            mn_device *d;
+            bool changed;
+            EnterCriticalSection(&g_sync_cs);
+            changed = devices_fold_scan_locked(f, nf);
+            if (changed) {
+                devices_save_locked();
+                devices_apply_active_locked();
+            }
+            d = mn_devreg_find(&g_devreg, ctx->dev_id);
+            if (d && (strcmp(d->host, ctx->host) != 0 || d->port != ctx->port)) {
+                snprintf(nhost, sizeof(nhost), "%s", d->host);
+                nport = d->port;
+            }
+            LeaveCriticalSection(&g_sync_cs);
+            if (changed) sync_state_save_host();
+        }
+        if (nhost[0]) {
+            fprintf(stderr, "[sync] retrying against relocated device at "
+                    "%s:%d\n", nhost, nport);
+            devices_emit(sync_grab_frame(), false);
+            snprintf(ctx->host, sizeof(ctx->host), "%s", nhost);
+            ctx->port = nport;
+            (void)mn_app_sync_run(g_app, ctx->host, ctx->port, &ctx->counts,
+                                  sync_progress_cb, ctx);
+        }
+    }
+
     if (ctx->frame) ctx->frame->base.release(&ctx->frame->base);
     InterlockedExchange(&g_sync_busy, 0);
     free(ctx);
@@ -5197,23 +5907,25 @@ static DWORD WINAPI sync_thread(LPVOID param) {
 
 /* Launch the full sync flow against the stored host (single-flight). Takes
  * ownership of frame_owned (may be NULL for the headless auto tick). */
-static void sync_start(cef_frame_t *frame_owned) {
+static void sync_start(cef_frame_t *frame_owned, bool auto_run) {
     ne_sync_ctx *ctx;
     HANDLE h;
     char   host[128];
-    int    port;
+    int    port, dev_id;
 
     EnterCriticalSection(&g_sync_cs);
     snprintf(host, sizeof(host), "%s", g_sync_host);
-    port = g_sync_port;
+    port   = g_sync_port;
+    dev_id = g_devreg.active_id;
     LeaveCriticalSection(&g_sync_cs);
     if (!host[0]) {
-        sync_emit_status(frame_owned, "error", 0, 0, 0,
-                         "no sync host configured");
+        sync_emit_status(frame_owned, "error", 0, 0, 0, 0, 0,
+                         "no device selected — pick or add your phone in "
+                         "Settings → Sync");
         return;
     }
     if (InterlockedCompareExchange(&g_sync_busy, 1, 0) != 0) {
-        sync_emit_status(frame_owned, "error", 0, 0, 0,
+        sync_emit_status(frame_owned, "error", 0, 0, 0, 0, 0,
                          "a sync is already running");
         return;
     }
@@ -5223,9 +5935,16 @@ static void sync_start(cef_frame_t *frame_owned) {
         if (frame_owned) frame_owned->base.release(&frame_owned->base);
         return;
     }
-    ctx->frame = frame_owned;
+    ctx->frame    = frame_owned;
+    ctx->dev_id   = dev_id;
+    ctx->auto_run = auto_run;
+    ctx->start_ms = sync_now_ms();
     snprintf(ctx->host, sizeof(ctx->host), "%s", host);
     ctx->port = port;
+    /* fresh flow: the status events' "what got synced" tallies reset */
+    EnterCriticalSection(&g_sync_cs);
+    memset(&g_sync_counts, 0, sizeof(g_sync_counts));
+    LeaveCriticalSection(&g_sync_cs);
     h = CreateThread(NULL, 0, sync_thread, ctx, 0, NULL);
     if (h) CloseHandle(h);
     else {
@@ -5276,7 +5995,7 @@ static void sync_auto_tick(void) {
         if (last > 0 && sync_now_ms() - last < gate_ms) return;
     }
     if (InterlockedCompareExchange(&g_sync_busy, 0, 0) != 0) return;
-    sync_start(sync_grab_frame());
+    sync_start(sync_grab_frame(), true);
 }
 
 /* --- snapshot file export / import worker ------------------------------- */
@@ -5340,6 +6059,745 @@ static void syncfile_start(cef_frame_t *frame_owned, bool import,
     h = CreateThread(NULL, 0, syncfile_thread, ctx, 0, NULL);
     if (h) CloseHandle(h);
     else { ctx->frame->base.release(&ctx->frame->base); free(ctx); }
+}
+
+/* ==========================================================================
+ * AMBIENT PRESENCE SCANNER — devices on the same network detect each other
+ * automatically. One long-lived thread broadcasts the discovery probe every
+ * NE_PRESENCE_PERIOD_MS (a handful of UDP datagrams — passive cost ~zero),
+ * folds the replies into the registry (online flags, model backfill, DHCP
+ * drift auto-follow with a log line) and the found list (unregistered
+ * responders the panel offers for ADDING — which stays a user click,
+ * always), then emits {"type":"syncdevices",...} so the panel and the
+ * player-bar phone chip stay live without any polling from JS.
+ *
+ * "Find devices" (and device mutations that want a fresh online flag) call
+ * presence_scan_kick() to collapse the wait: the event wakes the thread for
+ * an immediate pass whose emit carries scan:true (the UI's spinner cue).
+ * ========================================================================== */
+
+#define NE_PRESENCE_PERIOD_MS 30000   /* ambient cadence          */
+#define NE_PRESENCE_WINDOW_MS 2600    /* per-pass listen window   */
+
+static HANDLE        g_presence_evt    = NULL;   /* auto-reset wake  */
+static volatile LONG g_presence_forced = 0;      /* kick pending     */
+
+static void presence_scan_kick(void) {
+    InterlockedExchange(&g_presence_forced, 1);
+    if (g_presence_evt) SetEvent(g_presence_evt);
+}
+
+static DWORD WINAPI presence_scan_thread(LPVOID param) {
+    (void)param;
+    worker_enter();
+    for (;;) {
+        mn_found_device f[NE_FOUND_MAX];
+        int  nf;
+        bool changed;
+
+        if (InterlockedCompareExchange(&g_shutting_down, 0, 0)) break;
+        InterlockedExchange(&g_presence_forced, 0);
+
+        nf = mn_discover_scan(f, NE_FOUND_MAX, NE_PRESENCE_WINDOW_MS);
+
+        if (InterlockedCompareExchange(&g_shutting_down, 0, 0)) break;
+        EnterCriticalSection(&g_sync_cs);
+        changed = devices_fold_scan_locked(f, nf);
+        if (changed) {
+            devices_save_locked();
+            devices_apply_active_locked();
+        }
+        LeaveCriticalSection(&g_sync_cs);
+        if (changed) sync_state_save_host();
+
+        /* every pass emits: online flags age out and lastSeen ticks even
+         * when membership didn't change — one small JSON per ~30 s */
+        devices_emit(sync_grab_frame(), true);
+
+        /* park until the next ambient pass (or a kick / shutdown) */
+        if (g_presence_evt) {
+            WaitForSingleObject(g_presence_evt, NE_PRESENCE_PERIOD_MS);
+        } else {
+            Sleep(NE_PRESENCE_PERIOD_MS);
+        }
+    }
+    worker_leave();
+    return 0;
+}
+
+/* Start the ambient scanner (once, at browser-process startup). NOTE: a
+ * different presence_start(frame) exists below — that one is the "on
+ * phone?" TRACK-presence probe; this is DEVICE presence. */
+static void presence_scan_start(void) {
+    HANDLE h;
+    g_presence_evt = CreateEventA(NULL, FALSE /* auto-reset */, FALSE, NULL);
+    h = CreateThread(NULL, 0, presence_scan_thread, NULL, 0, NULL);
+    if (h) CloseHandle(h);
+}
+
+/* ==========================================================================
+ * DESKTOP REMOTE CONTROL (phone -> PC) — the mirror of the phone's
+ * /control/* surface. control.c owns the socket; this section owns the
+ * token (minted once, persisted beside the other sync state), the app
+ * callbacks, and the activity-log hook. The token reaches the phone
+ * inside pushed sync snapshots (the "control" block, see sync.h) — the
+ * pairing ceremony IS the sync the user already trusts.
+ * ========================================================================== */
+
+static char g_control_token[128];
+
+/* Load sync\control_token.txt, minting a fresh 160-bit hex token on first
+ * run (CryptGenRandom; falls back to a tick/pid stir only if the CSP is
+ * somehow unavailable). */
+static void control_token_load(void) {
+    char  path[1400];
+    FILE *f;
+    sync_file_path("control_token.txt", path, sizeof(path));
+    g_control_token[0] = 0;
+    f = fopen(path, "rb");
+    if (f) {
+        size_t n = fread(g_control_token, 1, sizeof(g_control_token) - 1, f);
+        fclose(f);
+        while (n > 0 && (g_control_token[n - 1] == '\n' ||
+                         g_control_token[n - 1] == '\r' ||
+                         g_control_token[n - 1] == ' ')) n--;
+        g_control_token[n] = 0;
+    }
+    if (strlen(g_control_token) >= 20) return;   /* usable persisted token */
+    {
+        unsigned char raw[20];
+        size_t i;
+        HCRYPTPROV prov = 0;
+        bool ok = CryptAcquireContextA(&prov, NULL, NULL, PROV_RSA_FULL,
+                                       CRYPT_VERIFYCONTEXT) &&
+                  CryptGenRandom(prov, sizeof(raw), raw);
+        if (prov) CryptReleaseContext(prov, 0);
+        if (!ok) {
+            ULONGLONG t = GetTickCount64();
+            unsigned  pid = (unsigned)GetCurrentProcessId();
+            for (i = 0; i < sizeof(raw); i++) {
+                t = t * 6364136223846793005ULL + 1442695040888963407ULL;
+                raw[i] = (unsigned char)((t >> 33) ^ (pid >> (i & 7)));
+            }
+        }
+        for (i = 0; i < sizeof(raw); i++) {
+            snprintf(g_control_token + i * 2, 3, "%02x", raw[i]);
+        }
+        f = fopen(path, "wb");
+        if (f) {
+            fputs(g_control_token, f);
+            fclose(f);
+        }
+    }
+}
+
+/* status callback — serialized on the LISTENER thread. mn_app_now_lite
+ * deliberately (no art stat per 1 Hz poll), fields mirroring the phone's
+ * /control/status shape so one client renders both ends. */
+static char *control_status_cb(void *user) {
+    mn_now now;
+    strbuf b;
+    (void)user;
+    if (!g_app) return NULL;
+    mn_app_now_lite(g_app, &now);
+    sb_init(&b);
+    sb_puts(&b, "{\"app\":\"monatomic\",\"playing\":");
+    sb_json_bool(&b, now.playing);
+    sb_puts(&b, ",\"positionMs\":"); sb_json_i64(&b, now.position_ms);
+    sb_puts(&b, ",\"durationMs\":"); sb_json_i64(&b, now.duration_ms);
+    sb_puts(&b, ",\"volume\":");     sb_json_float(&b, now.volume);
+    sb_puts(&b, ",\"title\":");      sb_json_str(&b, now.track_title);
+    sb_puts(&b, ",\"artist\":");     sb_json_str(&b, now.track_artist);
+    sb_puts(&b, ",\"album\":");      sb_json_str(&b, now.track_album);
+    sb_puts(&b, ",\"liked\":");      sb_json_bool(&b, now.liked == 1);
+    sb_puts(&b, ",\"shuffle\":");    sb_json_bool(&b, now.shuffle);
+    sb_putc(&b, '}');
+    if (b.oom) { sb_free(&b); return NULL; }
+    return b.data;   /* control.c frees */
+}
+
+static bool control_command_cb(void *user, const char *name, double arg,
+                               bool has_arg) {
+    mn_now now;
+    (void)user;
+    if (!g_app) return false;
+    if (strcmp(name, "toggle") == 0)      { mn_app_toggle_pause(g_app); return true; }
+    if (strcmp(name, "stop") == 0)        { mn_app_stop(g_app);         return true; }
+    if (strcmp(name, "next") == 0)        { mn_app_next(g_app);         return true; }
+    if (strcmp(name, "prev") == 0)        { mn_app_prev(g_app);         return true; }
+    if (strcmp(name, "play") == 0 || strcmp(name, "pause") == 0) {
+        /* toggle_pause is the only transport primitive; make play/pause
+         * idempotent by consulting the live state first. */
+        mn_app_now_lite(g_app, &now);
+        if ((strcmp(name, "play") == 0) != now.playing) {
+            mn_app_toggle_pause(g_app);
+        }
+        return true;
+    }
+    if (strcmp(name, "seek") == 0 && has_arg) {
+        if (arg < 0) arg = 0;
+        mn_app_seek_ms(g_app, (int64_t)arg);
+        return true;
+    }
+    if (strcmp(name, "seekby") == 0 && has_arg) {
+        int64_t target;
+        mn_app_now_lite(g_app, &now);
+        target = now.position_ms + (int64_t)arg;
+        if (target < 0) target = 0;
+        mn_app_seek_ms(g_app, target);
+        return true;
+    }
+    if (strcmp(name, "volume") == 0 && has_arg) {
+        if (arg < 0) arg = 0;
+        if (arg > 1) arg = 1;
+        mn_app_set_volume(g_app, (float)arg);
+        return true;
+    }
+    return false;
+}
+
+/* One activity-log line per controlling phone per stretch (control.c
+ * rate-limits the calls). */
+static void control_session_cb(void *user, const char *client_ip) {
+    strbuf lb;
+    (void)user;
+    sb_init(&lb);
+    sb_puts(&lb, "\"ev\":\"remote\",\"host\":");
+    sb_json_str(&lb, client_ip ? client_ip : "?");
+    if (!lb.oom) synclog_write(lb.data);
+    sb_free(&lb);
+}
+
+static void control_thread_begin_cb(void *user) { (void)user; worker_enter(); }
+static void control_thread_end_cb(void *user)   { (void)user; worker_leave(); }
+
+/* Start the listener + advertise it in pushed snapshots. Called once at
+ * browser-process startup, after sync_state_load (needs g_data_dir). */
+static void control_listener_start(void) {
+    mn_control_env env;
+    char host_name[64];
+    DWORD hn = (DWORD)sizeof(host_name);
+    control_token_load();
+    if (!g_control_token[0]) return;
+    if (!GetComputerNameA(host_name, &hn)) {
+        snprintf(host_name, sizeof(host_name), "Monatomic PC");
+    }
+    memset(&env, 0, sizeof(env));
+    env.status       = control_status_cb;
+    env.command      = control_command_cb;
+    env.session      = control_session_cb;
+    env.thread_begin = control_thread_begin_cb;
+    env.thread_end   = control_thread_end_cb;
+    if (mn_control_start(&env, MN_CONTROL_DEFAULT_PORT, g_control_token)) {
+        /* only advertise a listener that actually bound */
+        mn_app_set_control_info(g_app, MN_CONTROL_DEFAULT_PORT,
+                                g_control_token, host_name);
+        fprintf(stderr, "[control] listener on :%d (%s)\n",
+                MN_CONTROL_DEFAULT_PORT, host_name);
+    } else {
+        fprintf(stderr, "[control] could not bind :%d — remote control off\n",
+                MN_CONTROL_DEFAULT_PORT);
+    }
+}
+
+/* ==========================================================================
+ * WIRELESS FILE TRANSFER — iTunes-style "send to phone" over the sync
+ * bridge. Dropped/picked files land in a FIFO queue drained by ONE worker
+ * (sequential uploads never fight each other for the Wi-Fi link); each file
+ * is fingerprinted with the schema-v7 recipe (file_content_fp below), the
+ * phone is asked via GET /sync/have whether it already has that hash
+ * (skip + report), and otherwise the raw bytes stream out through
+ * mn_sync_send_file (POST /sync/file). Progress event contract (the UI HUD
+ * binds against this):
+ *   {"type":"xfer","state":"start|progress|done|error","file":"<name>",
+ *    "index":N,"total":M,"sentBytes":X,"totalBytes":Y,
+ *    "skipped":bool,"error":"<message or empty>"}
+ * index/total are 1-based within the current batch; more files enqueued
+ * mid-run extend `total`. "done" with skipped:true = phone already had it.
+ * ========================================================================== */
+
+/* Defined with the hash backfill below; the recipe is shared. */
+static bool file_content_fp(const char *path, char *out, size_t outn);
+
+typedef struct ne_xfer_node {
+    struct ne_xfer_node *next;
+    char                 path[1024];
+} ne_xfer_node;
+
+static CRITICAL_SECTION g_xfer_cs;          /* guards the queue + counters */
+static ne_xfer_node    *g_xfer_head = NULL;
+static ne_xfer_node    *g_xfer_tail = NULL;
+static int              g_xfer_total = 0;   /* enqueued this batch          */
+static int              g_xfer_done  = 0;   /* started this batch           */
+static volatile LONG    g_xfer_busy  = 0;   /* single worker                */
+
+typedef struct { cef_frame_t *frame; } ne_xfer_ctx;
+
+/* Emit one xfer event (frame NOT consumed; NULL frame = no-op). */
+static void xfer_emit(cef_frame_t *frame, const char *state, const char *file,
+                      int index, int total, int64_t sent, int64_t total_b,
+                      bool skipped, const char *error) {
+    strbuf b;
+    if (!frame) return;
+    sb_init(&b);
+    sb_puts(&b, "{\"type\":\"xfer\",\"state\":");
+    sb_json_str(&b, state);
+    sb_puts(&b, ",\"file\":");
+    sb_json_str(&b, file);
+    sb_puts(&b, ",\"index\":");
+    sb_json_int(&b, index);
+    sb_puts(&b, ",\"total\":");
+    sb_json_int(&b, total);
+    sb_puts(&b, ",\"sentBytes\":");
+    sb_json_i64(&b, sent);
+    sb_puts(&b, ",\"totalBytes\":");
+    sb_json_i64(&b, total_b);
+    sb_puts(&b, ",\"skipped\":");
+    sb_json_bool(&b, skipped);
+    sb_puts(&b, ",\"error\":");
+    sb_json_str(&b, error ? error : "");
+    sb_putc(&b, '}');
+    if (!b.oom) {
+        frame->base.add_ref(&frame->base);
+        post_emit_owned(frame, b.data);   /* consumes the extra ref */
+    } else {
+        sb_free(&b);
+    }
+}
+
+/* The path's leaf (what the phone should call the file). */
+static const char *xfer_leaf(const char *path) {
+    const char *a = strrchr(path, '\\');
+    const char *b = strrchr(path, '/');
+    const char *p = (a > b) ? a : b;
+    return p ? p + 1 : path;
+}
+
+/* Progress relay: throttled so a 200 MB file doesn't flood the bridge
+ * (at most ~4 events/s; the final chunk always reports). */
+typedef struct {
+    cef_frame_t *frame;
+    const char  *name;
+    int          index, total;
+    ULONGLONG    last_tick;
+} ne_xfer_prog;
+
+static void xfer_progress_cb(void *user, int64_t sent, int64_t total) {
+    ne_xfer_prog *p = (ne_xfer_prog *)user;
+    ULONGLONG t = GetTickCount64();
+    if (sent < total && t - p->last_tick < 250) return;
+    p->last_tick = t;
+    xfer_emit(p->frame, "progress", p->name, p->index, p->total,
+              sent, total, false, "");
+}
+
+/* Upload one queued file: start event -> fingerprint -> have-check (skip
+ * when the phone already has the hash) -> streamed POST. Every outcome
+ * emits exactly one terminal done/error event. */
+static void xfer_one(cef_frame_t *frame, const char *host, int port,
+                     const char *path, int index, int total) {
+    const char *name = xfer_leaf(path);
+    char        hex[24];
+    char        errbuf[160];
+    int64_t     size = 0;
+    bool        skipped = false;
+
+    {
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            if (_fseeki64(f, 0, SEEK_END) == 0) size = _ftelli64(f);
+            fclose(f);
+        }
+    }
+    if (size <= 0) {
+        xfer_emit(frame, "error", name, index, total, 0, 0, false,
+                  "cannot open the file");
+        return;
+    }
+    xfer_emit(frame, "start", name, index, total, 0, size, false, "");
+    if (!file_content_fp(path, hex, sizeof(hex))) {
+        xfer_emit(frame, "error", name, index, total, 0, size, false,
+                  "cannot read the file");
+        return;
+    }
+    /* Already on the phone? One-hash have-query; a failed query degrades
+     * to just uploading (the endpoint dedupes by hash anyway). */
+    {
+        char *body = mn_sync_have(host, port, hex);
+        if (body) {
+            skipped = strstr(body, hex) != NULL;
+            free(body);
+        }
+    }
+    if (skipped) {
+        xfer_emit(frame, "done", name, index, total, 0, size, true, "");
+        return;
+    }
+    {
+        ne_xfer_prog prog;
+        prog.frame     = frame;
+        prog.name      = name;
+        prog.index     = index;
+        prog.total     = total;
+        prog.last_tick = 0;
+        errbuf[0] = 0;
+        if (mn_sync_send_file(host, port, path, name, hex,
+                              xfer_progress_cb, &prog, &skipped,
+                              errbuf, sizeof(errbuf))) {
+            xfer_emit(frame, "done", name, index, total, size, size,
+                      skipped, "");
+        } else {
+            xfer_emit(frame, "error", name, index, total, 0, size, false,
+                      errbuf[0] ? errbuf : "upload failed");
+        }
+    }
+}
+
+static DWORD WINAPI xfer_thread(LPVOID param) {
+    worker_enter();
+    ne_xfer_ctx *ctx = (ne_xfer_ctx *)param;
+    char host[128];
+    int  port;
+
+    EnterCriticalSection(&g_sync_cs);
+    snprintf(host, sizeof(host), "%s", g_sync_host);
+    port = g_sync_port;
+    LeaveCriticalSection(&g_sync_cs);
+
+    for (;;) {
+        ne_xfer_node *nd = NULL;
+        int  index = 0, total = 0;
+        bool stop = !host[0] ||
+                    InterlockedCompareExchange(&g_shutting_down, 0, 0) != 0;
+
+        /* Pop under the SAME lock enqueuers append + busy-check under, and
+         * clear busy inside it on the empty branch — a drop landing during
+         * this window is either seen by this loop or starts a new worker,
+         * never lost. */
+        EnterCriticalSection(&g_xfer_cs);
+        if (!stop && g_xfer_head) {
+            nd = g_xfer_head;
+            g_xfer_head = nd->next;
+            if (!g_xfer_head) g_xfer_tail = NULL;
+            index = ++g_xfer_done;
+            total = g_xfer_total;
+        } else {
+            while (g_xfer_head) {   /* drained on stop; empty otherwise */
+                ne_xfer_node *n2 = g_xfer_head;
+                g_xfer_head = n2->next;
+                free(n2);
+            }
+            g_xfer_tail  = NULL;
+            g_xfer_total = 0;
+            g_xfer_done  = 0;
+            InterlockedExchange(&g_xfer_busy, 0);
+        }
+        LeaveCriticalSection(&g_xfer_cs);
+        if (!nd) {
+            if (!host[0]) {
+                xfer_emit(ctx->frame, "error", "", 0, 0, 0, 0, false,
+                          "no phone configured — set it in Settings \xE2\x86\x92 Sync");
+            }
+            break;
+        }
+        xfer_one(ctx->frame, host, port, nd->path, index, total);
+        free(nd);
+    }
+    if (ctx->frame) ctx->frame->base.release(&ctx->frame->base);
+    free(ctx);
+    worker_leave();
+    return 0;
+}
+
+/* Append one path to the transfer queue. Caller holds g_xfer_cs. */
+static bool xfer_queue_push_locked(const char *path) {
+    ne_xfer_node *nd = (ne_xfer_node *)calloc(1, sizeof(*nd));
+    if (!nd) return false;
+    snprintf(nd->path, sizeof(nd->path), "%s", path);
+    if (g_xfer_tail) g_xfer_tail->next = nd;
+    else             g_xfer_head = nd;
+    g_xfer_tail = nd;
+    g_xfer_total++;
+    return true;
+}
+
+/* Start the drain worker when idle (a running worker will see the new queue
+ * entries itself). Consumes frame_owned either way. */
+static void xfer_kick(cef_frame_t *frame_owned) {
+    ne_xfer_ctx *ctx;
+    HANDLE       h;
+    if (InterlockedCompareExchange(&g_xfer_busy, 1, 0) != 0) {
+        if (frame_owned) frame_owned->base.release(&frame_owned->base);
+        return;
+    }
+    ctx = (ne_xfer_ctx *)calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        InterlockedExchange(&g_xfer_busy, 0);
+        if (frame_owned) frame_owned->base.release(&frame_owned->base);
+        return;
+    }
+    ctx->frame = frame_owned;
+    h = CreateThread(NULL, 0, xfer_thread, ctx, 0, NULL);
+    if (h) CloseHandle(h);
+    else {
+        InterlockedExchange(&g_xfer_busy, 0);
+        if (ctx->frame) ctx->frame->base.release(&ctx->frame->base);
+        free(ctx);
+    }
+}
+
+/* Decode the next string element of a JSON array (same escape handling as
+ * json_get_str). *pp advances past the element. False at the array end. */
+static bool json_arr_next_str(const char **pp, char *out, size_t out_n) {
+    const char *v = *pp;
+    size_t o = 0;
+    while (*v && *v != '"' && *v != ']') v++;
+    if (*v != '"') { *pp = v; return false; }
+    v++;
+    while (*v && *v != '"') {
+        char c = *v++;
+        if (c == '\\' && *v) {
+            char e = *v++;
+            switch (e) {
+                case 'n':  c = '\n'; break;
+                case 't':  c = '\t'; break;
+                case 'r':  c = '\r'; break;
+                case 'b':  c = '\b'; break;
+                case 'f':  c = '\f'; break;
+                case '/':  c = '/';  break;
+                case '"':  c = '"';  break;
+                case '\\': c = '\\'; break;
+                case 'u': {
+                    unsigned cp = 0; int ok = 1;
+                    for (int i = 0; i < 4; i++) {
+                        char hch = *v;
+                        if      (hch >= '0' && hch <= '9') cp = (cp << 4) + (unsigned)(hch - '0');
+                        else if (hch >= 'a' && hch <= 'f') cp = (cp << 4) + (unsigned)(hch - 'a' + 10);
+                        else if (hch >= 'A' && hch <= 'F') cp = (cp << 4) + (unsigned)(hch - 'A' + 10);
+                        else { ok = 0; break; }
+                        v++;
+                    }
+                    if (!ok) continue;
+                    if (cp < 0x80) {
+                        if (o + 1 < out_n) out[o++] = (char)cp;
+                    } else if (cp < 0x800) {
+                        if (o + 2 < out_n) {
+                            out[o++] = (char)(0xC0 | (cp >> 6));
+                            out[o++] = (char)(0x80 | (cp & 0x3F));
+                        }
+                    } else {
+                        if (o + 3 < out_n) {
+                            out[o++] = (char)(0xE0 | (cp >> 12));
+                            out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                            out[o++] = (char)(0x80 | (cp & 0x3F));
+                        }
+                    }
+                    continue;
+                }
+                default:   c = e; break;
+            }
+        }
+        if (o + 1 < out_n) out[o++] = c;
+    }
+    if (*v == '"') v++;
+    if (out_n) out[o] = 0;
+    *pp = v;
+    return true;
+}
+
+/* {"cmd":"sendfiles","paths":[...]}: enqueue + kick. Consumes the ref. */
+static void xfer_enqueue_json(cef_frame_t *frame_owned, const char *json) {
+    const char *v = json_find_value(json, "paths");
+    int added = 0;
+    if (v && *v == '[') {
+        char path[1024];
+        v++;
+        EnterCriticalSection(&g_xfer_cs);
+        while (json_arr_next_str(&v, path, sizeof(path))) {
+            if (path[0] && xfer_queue_push_locked(path)) added++;
+        }
+        LeaveCriticalSection(&g_xfer_cs);
+    }
+    if (added > 0) xfer_kick(frame_owned);
+    else if (frame_owned) frame_owned->base.release(&frame_owned->base);
+}
+
+/* --- native multi-select picker fallback (drag-drop without file paths) -- */
+
+typedef struct { cef_frame_t *frame; } ne_sendpick_ctx;
+
+static DWORD WINAPI sendpick_thread(LPVOID param) {
+    worker_enter();
+    ne_sendpick_ctx *ctx = (ne_sendpick_ctx *)param;
+    int added = 0;
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    IFileOpenDialog *dlg = NULL;
+    if (SUCCEEDED(CoCreateInstance(&CLSID_FileOpenDialog, NULL,
+                                   CLSCTX_INPROC_SERVER, &IID_IFileOpenDialog,
+                                   (void **)&dlg)) && dlg) {
+        COMDLG_FILTERSPEC filt[2] = {
+            { L"Audio files",
+              L"*.mp3;*.flac;*.m4a;*.aac;*.ogg;*.oga;*.opus;*.wav;*.wma;"
+              L"*.aif;*.aiff;*.ape;*.mka;*.dsf;*.dff" },
+            { L"All files", L"*.*" },
+        };
+        DWORD opts = 0;
+        dlg->lpVtbl->GetOptions(dlg, &opts);
+        dlg->lpVtbl->SetOptions(dlg, opts | FOS_ALLOWMULTISELECT |
+                                FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
+        dlg->lpVtbl->SetFileTypes(dlg, 2, filt);
+        dlg->lpVtbl->SetTitle(dlg, L"Send files to phone");
+        if (SUCCEEDED(dlg->lpVtbl->Show(dlg, g_host_hwnd))) {
+            IShellItemArray *items = NULL;
+            if (SUCCEEDED(dlg->lpVtbl->GetResults(dlg, &items)) && items) {
+                DWORD count = 0, i;
+                items->lpVtbl->GetCount(items, &count);
+                EnterCriticalSection(&g_xfer_cs);
+                for (i = 0; i < count; i++) {
+                    IShellItem *item = NULL;
+                    if (SUCCEEDED(items->lpVtbl->GetItemAt(items, i, &item))
+                        && item) {
+                        PWSTR wpath = NULL;
+                        if (SUCCEEDED(item->lpVtbl->GetDisplayName(
+                                item, SIGDN_FILESYSPATH, &wpath)) && wpath) {
+                            char path[1024];
+                            if (WideCharToMultiByte(CP_UTF8, 0, wpath, -1,
+                                                    path, (int)sizeof(path),
+                                                    NULL, NULL) > 0 &&
+                                path[0] && xfer_queue_push_locked(path)) {
+                                added++;
+                            }
+                            CoTaskMemFree(wpath);
+                        }
+                        item->lpVtbl->Release(item);
+                    }
+                }
+                LeaveCriticalSection(&g_xfer_cs);
+                items->lpVtbl->Release(items);
+            }
+        }
+        dlg->lpVtbl->Release(dlg);
+    }
+    if (SUCCEEDED(hr)) CoUninitialize();
+    if (added > 0) xfer_kick(ctx->frame);   /* consumes the ref */
+    else if (ctx->frame) ctx->frame->base.release(&ctx->frame->base);
+    free(ctx);
+    worker_leave();
+    return 0;
+}
+
+static void sendpick_start(cef_frame_t *frame_owned) {
+    ne_sendpick_ctx *ctx = (ne_sendpick_ctx *)calloc(1, sizeof(*ctx));
+    HANDLE h;
+    if (!ctx) {
+        frame_owned->base.release(&frame_owned->base);
+        return;
+    }
+    ctx->frame = frame_owned;
+    h = CreateThread(NULL, 0, sendpick_thread, ctx, 0, NULL);
+    if (h) CloseHandle(h);
+    else { ctx->frame->base.release(&ctx->frame->base); free(ctx); }
+}
+
+/* --- "on phone?" presence probe ------------------------------------------ */
+
+/* Cap + per-URL batch: 16-hex hashes joined by commas keep even a 1400-hash
+ * URL around ~24 KB, safely inside the phone server's line limits. */
+#define NE_PRES_MAX   5000
+#define NE_PRES_BATCH 1400
+
+static volatile LONG g_presence_busy = 0;
+
+static DWORD WINAPI presence_thread(LPVOID param) {
+    worker_enter();
+    cef_frame_t *frame = (cef_frame_t *)param;   /* owned ref */
+    char     host[128];
+    int      port, n = 0, i;
+    bool     ok = false;
+    int64_t *ids            = (int64_t *)malloc(sizeof(int64_t) * NE_PRES_MAX);
+    char   (*hashes)[24]    = (char (*)[24])malloc(24 * NE_PRES_MAX);
+    char    *have           = (char *)calloc(NE_PRES_MAX, 1);
+
+    EnterCriticalSection(&g_sync_cs);
+    snprintf(host, sizeof(host), "%s", g_sync_host);
+    port = g_sync_port;
+    LeaveCriticalSection(&g_sync_cs);
+
+    if (host[0] && ids && hashes && have && g_app) {
+        n = mn_app_hashed_rows(g_app, ids, hashes, NE_PRES_MAX);
+        ok = true;
+        for (i = 0; i < n; i += NE_PRES_BATCH) {
+            int    cnt = (n - i < NE_PRES_BATCH) ? (n - i) : NE_PRES_BATCH;
+            int    j;
+            char  *body;
+            strbuf csv;
+            sb_init(&csv);
+            for (j = 0; j < cnt; j++) {
+                if (j) sb_putc(&csv, ',');
+                sb_puts(&csv, hashes[i + j]);
+            }
+            body = csv.oom ? NULL : mn_sync_have(host, port, csv.data);
+            sb_free(&csv);
+            if (!body) { ok = false; break; }   /* unreachable: fail soft */
+            /* every entry is exactly 16 hex chars, so a substring hit IS an
+             * exact match against the reply's have[] array */
+            for (j = 0; j < cnt; j++) {
+                if (strstr(body, hashes[i + j])) have[i + j] = 1;
+            }
+            free(body);
+        }
+    }
+
+    {
+        strbuf b;
+        int    first;
+        sb_init(&b);
+        sb_puts(&b, "{\"type\":\"presence\",\"ok\":");
+        sb_json_bool(&b, ok);
+        sb_puts(&b, ",\"have\":[");
+        for (i = 0, first = 1; i < n; i++) {
+            if (!have || !have[i]) continue;
+            if (!first) sb_putc(&b, ',');
+            first = 0;
+            sb_json_str(&b, hashes[i]);
+        }
+        sb_puts(&b, "],\"ids\":[");
+        for (i = 0, first = 1; i < n; i++) {
+            if (!have || !have[i]) continue;
+            if (!first) sb_putc(&b, ',');
+            first = 0;
+            sb_json_i64(&b, ids[i]);
+        }
+        sb_puts(&b, "]}");
+        if (!b.oom) {
+            post_emit_owned(frame, b.data);
+        } else {
+            sb_free(&b);
+            frame->base.release(&frame->base);
+        }
+    }
+    free(ids);
+    free(hashes);
+    free(have);
+    InterlockedExchange(&g_presence_busy, 0);
+    worker_leave();
+    return 0;
+}
+
+/* Launch the probe (single-flight; an overlapping request is dropped —
+ * the in-flight one's reply is about to arrive). Consumes frame_owned. */
+static void presence_start(cef_frame_t *frame_owned) {
+    HANDLE h;
+    if (InterlockedCompareExchange(&g_presence_busy, 1, 0) != 0) {
+        frame_owned->base.release(&frame_owned->base);
+        return;
+    }
+    h = CreateThread(NULL, 0, presence_thread, frame_owned, 0, NULL);
+    if (h) CloseHandle(h);
+    else {
+        InterlockedExchange(&g_presence_busy, 0);
+        frame_owned->base.release(&frame_owned->base);
+    }
 }
 
 /* --- purge-missing worker ------------------------------------------------ */
@@ -9100,7 +10558,10 @@ int webview_run(mn_app *app, const char *ui_dir, const char *art_dir) {
 
     setup_webroot();
     InitializeCriticalSection(&g_sync_cs);
+    InitializeCriticalSection(&g_xfer_cs);
     sync_state_load();      /* persisted sync host/auto/last (needs g_data_dir) */
+    presence_scan_start();  /* ambient device discovery (first pass ~now) */
+    control_listener_start(); /* phone -> PC remote control (token-gated) */
     depth_worker_start();   /* lazy model load happens on the worker itself */
     artenc_pool_start();    /* background art extraction (off the UI thread) */
     webart_migrate_kick();  /* one-time: reclaim the legacy webroot\art mirror */
@@ -9305,6 +10766,12 @@ int webview_run(mn_app *app, const char *ui_dir, const char *art_dir) {
      * — the classic quit-during-background-activity crash. The app-side
      * loops poll app->shutting_down, so flag it first for a fast drain. */
     if (g_app) mn_app_request_shutdown(g_app);
+    /* wake the ambient presence scanner out of its 30 s park so the worker
+     * drain below never has to wait it out (flag first, then the event) */
+    InterlockedExchange(&g_shutting_down, 1);
+    presence_scan_kick();
+    mn_control_stop();      /* close the listener; joins its thread (which
+                             * runs worker_leave via the thread_end hook) */
     workers_drain();
 
     cef_shutdown();
@@ -9312,6 +10779,7 @@ int webview_run(mn_app *app, const char *ui_dir, const char *art_dir) {
     depth_worker_stop();    /* join the depth thread + release its session */
     DeleteCriticalSection(&g_browser_lock);
     DeleteCriticalSection(&g_sync_cs);
+    DeleteCriticalSection(&g_xfer_cs);
 
     cef_string_clear(&settings.browser_subprocess_path);
     cef_string_clear(&settings.cache_path);

@@ -46,10 +46,20 @@
     return metaLinkWire(e, term != null ? term : value, kind, artist);
   }
 
+  /* Duration/position text. Rolls over into H:MM:SS at one hour and keeps
+     M:SS below it — a 25 h audiobook used to render as "1527:36" because the
+     minutes field was never reduced. This is THE formatter for every track
+     length in the app (track rows, album panels, queue pills, the seek bar's
+     elapsed/total, A-B loop tooltips, the details column), so audiobooks,
+     DJ sets and podcast episodes all read correctly from one fix.
+     fmtLong() further down predates this and is now identical in behaviour;
+     it is kept because the audiobook code calls it by name. */
   function fmtTime(ms) {
     if (!ms || ms < 0 || !isFinite(ms)) return "0:00";
-    const t = Math.floor(ms / 1000), m = Math.floor(t / 60), s = t % 60;
-    return m + ":" + String(s).padStart(2, "0");
+    const t = Math.floor(ms / 1000), h = Math.floor(t / 3600),
+          m = Math.floor((t % 3600) / 60), s = t % 60;
+    return h ? h + ":" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0")
+             : m + ":" + String(s).padStart(2, "0");
   }
 
   const STEM_NAMES = ["Sub Bass", "Bass", "Vocals", "Lead", "Instruments", "Wide", "Air", "Guitar", "Piano"];
@@ -420,12 +430,24 @@
   let volumetricActive = false;
   if (depthOk) MnDepthArt.setMotion(theme.motion);
 
+  /* ADAPTIVE SIZE TIERS (see initUiTiers near the bottom of this file):
+     true while the window has shrunk into the mini/micro widget layouts.
+     Declared HERE, above every consumer, because the depth-art, the CSS
+     tilt loop, the spectrum loop and the resize-end remeasure all have to
+     park when the app is a widget — a WebGL cover mesh and a 20 Hz FFT
+     poll are exactly the wrong things to keep alive in a 300px window.
+     initUiTiers (same closure) is what writes it. */
+  let uiSmallTier = false;
+  let uiTierApply = null;          /* set by initUiTiers; called on resize */
+
   /* the mesh should only render while it is actually on screen */
   let artFullscreen = false;
   function syncDepthActive() {
     if (!depthOk) return;
-    /* visible if: fullscreen, OR the now-playing panel is open */
-    const onScreen = artFullscreen || !E.app.classList.contains("np-collapsed");
+    /* visible if: fullscreen, OR the now-playing panel is open — and never
+       in the widget tiers, where the cover is a flat image by design */
+    const onScreen = !uiSmallTier &&
+        (artFullscreen || !E.app.classList.contains("np-collapsed"));
     MnDepthArt.setActive(volumetricActive && theme.art3d && onScreen);
   }
 
@@ -480,7 +502,11 @@
       volRetryN = 0;
       volRetryUrl = artUrl || "";
     }
-    if (!depthOk || !artUrl || !theme.art3d) {
+    /* uiSmallTier: the widget layouts show a flat, full-bleed cover — this
+       branch is also how the mesh is TORN DOWN on the way into mini (it
+       clears the canvas AND the visibility:hidden this function puts on the
+       flat cover, which would otherwise leave the widget showing nothing). */
+    if (!depthOk || !artUrl || !theme.art3d || uiSmallTier) {
       volumetricActive = false;
       if (depthCanvas) depthCanvas.hidden = true;
       E.npArt.style.visibility = "";
@@ -532,6 +558,7 @@
   let artStyleReset = true, glareQx = -1, glareQy = -1;
   function cssArtAnimating() {
     if (volumetricActive || !theme.art3d || theme.motion === "off") return false;
+    if (uiSmallTier) return false;    /* widget: flat cover, no tilt loop */
     const onScreen = artFullscreen || !E.app.classList.contains("np-collapsed");
     if (!onScreen) return false;
     const playing = !!(state.now && state.now.playing);
@@ -603,10 +630,14 @@
     return th;
   }
 
-  function ratingCell(row) {
-    const wrap = el("div", "c-rating");
-    /* Android-style thumbs (liked: 1 / -1 / 0) — coexists with the stars,
-       like MediaMonkey. Degrades gracefully if the backend lacks "like". */
+  /* STAR RATINGS REMOVED (2026-08-24): the 5-star widgets are gone from the
+     player — like/dislike is the whole preference surface now. The DB's
+     rating_x2 column and stored values are untouched (display/edit removal
+     only), and sync no longer exports stars. */
+  function likeCell(row) {
+    const wrap = el("div", "c-like");
+    /* Android-style thumbs (liked: 1 / -1 / 0). Degrades gracefully if the
+       backend lacks "like". */
     const up = el("span", "thumb up" + (row.liked === 1 ? " on" : ""), "👍");
     const dn = el("span", "thumb down" + (row.liked === -1 ? " on" : ""), "👎");
     const setLiked = (v) => {
@@ -619,21 +650,7 @@
     up.addEventListener("click", (ev) => { ev.stopPropagation(); setLiked(row.liked === 1 ? 0 : 1); });
     dn.addEventListener("click", (ev) => { ev.stopPropagation(); setLiked(row.liked === -1 ? 0 : -1); });
     wrap.appendChild(up); wrap.appendChild(dn);
-    for (let i = 1; i <= 5; i++) {
-      const st = el("span", "star" + (i <= (row.rating || 0) ? " on" : ""), "★");
-      st.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        const stars = (row.rating === i) ? 0 : i;
-        row.rating = stars;
-        send({ cmd: "rating", id: row.id, stars });
-        renderRatingInRow(wrap, stars);
-      });
-      wrap.appendChild(st);
-    }
     return wrap;
-  }
-  function renderRatingInRow(wrap, stars) {
-    $$(".star", wrap).forEach((s, i) => s.classList.toggle("on", i < stars));
   }
 
   function trackRowEl(row, index) {
@@ -659,13 +676,18 @@
       nb.title = "Recently added to the library (within " + PREFS.newdays + " days)";
       title.appendChild(nb);
     }
+    /* "on phone?" presence glyph (set + builder owned by synchud.js) */
+    if (typeof window.__mnOnPhone === "function" && window.__mnOnPhone(row.id)
+        && typeof window.__mnPhoneBadge === "function") {
+      title.appendChild(window.__mnPhoneBadge());
+    }
     r.appendChild(title);
     r.appendChild(metaLink("c-artist", row.artist, null, "artist"));
     r.appendChild(metaLink("c-album", row.album, null, "album", row.artist));
     r.appendChild(el("div", "c-year", row.year ? String(row.year) : ""));
     r.appendChild(metaLink("c-genre", row.genre));
     r.appendChild(el("div", "c-dur", fmtTime(row.duration_ms)));
-    r.appendChild(ratingCell(row));
+    r.appendChild(likeCell(row));
 
     r.addEventListener("click", (ev) => {
       const scope = r.parentNode || E.trackRows;
@@ -906,11 +928,19 @@
     let offTimer = 0, on = false;
     const stop = () => {
       on = false; body.classList.remove("resizing");
+      /* the widget tiers hide #main outright — the album grid has no width
+         to measure and vgRefresh would just burn its 30-frame retry budget */
+      if (uiSmallTier) return;
       /* column count / card width changed with the window */
       if (VG.on) { vgRefresh(); reflowExpand(); }
       else remeasureAlbCard();
     };
     const ro = new ResizeObserver(() => {
+      /* SIZE TIER FIRST: stamp data-ui-tier before anything else reacts to
+         the new size, so the same frame that resizes also re-lays out. This
+         observer already exists for body.resizing — reusing it keeps the
+         "no work at idle" contract (one observer, zero polling). */
+      if (uiTierApply) uiTierApply();
       if (!on) { on = true; body.classList.add("resizing"); }
       clearTimeout(offTimer);
       offTimer = setTimeout(stop, 140);
@@ -2633,7 +2663,6 @@
         case "genre":    return row.genre ? letterOf(row.genre) : "·";
         case "year":     return row.year ? String(row.year) : "—";
         case "duration": return fmtTime(row.duration_ms);
-        case "rating":   return row.rating ? "★" + row.rating : "unrated";
         case "plays":    return (row.play_count || 0) + "×";
         case "added": {
           if (!row.date_added) return "—";
@@ -3408,7 +3437,7 @@
     state.view = 0;
     try { localStorage.setItem("mn.lastview", "0"); } catch (_) {}
     $$(".nav-item").forEach((n) => n.classList.toggle("active", n.dataset.view === "cat:" + key));
-    if (E.sort) { E.sort.value = /^(title|artist|album|year|rating|added)$/.test(c.sort) ? c.sort : ""; }
+    if (E.sort) { E.sort.value = /^(title|artist|album|year|added)$/.test(c.sort) ? c.sort : ""; }
     clearColSortInd();
     updateCatHeader();
     showPanel("view-tracks");
@@ -3820,7 +3849,7 @@
     searchTimer = setTimeout(() => runSearch(q), state.searchOpen ? 90 : 130);
   });
   /* Natural default direction per key: recency/popularity descend, text asc. */
-  const SORT_DEFAULT_ASC = { added: false, created: false, plays: false, year: false, rating: false, duration: false };
+  const SORT_DEFAULT_ASC = { added: false, created: false, plays: false, year: false, duration: false };
   function defaultAsc(key) { return SORT_DEFAULT_ASC[key] !== false; }
   const sortDirBtn = $("#sort-dir");
   function updateSortDirUI() {
@@ -3859,7 +3888,7 @@
     /* re-clicking the active column flips; a new column uses its natural default */
     if (state.sort === by) state.sortAsc = !state.sortAsc;
     else { state.sort = by; state.sortAsc = defaultAsc(by); }
-    if (E.sort && /^(title|artist|album|genre|year|duration|rating|plays|added|created)$/.test(by)) E.sort.value = by;
+    if (E.sort && /^(title|artist|album|genre|year|duration|plays|added|created)$/.test(by)) E.sort.value = by;
     applySort(false);
     th.classList.add(state.sortAsc ? "sort-asc" : "sort-desc");
     resetTracks(); loadTracks();
@@ -3869,7 +3898,14 @@
      to skip the push and the C default leaked through: artist-ordered
      lists under a dropdown that said "Title"). */
   {
-    const ss = localStorage.getItem("mn.sort");
+    let ss = localStorage.getItem("mn.sort");
+    /* Sort-by-Rating was removed with the star system: a persisted
+       "rating" would land on a <select> with no such option (silently "")
+       while still pushing rating-order to C. Sanitize to the default. */
+    if (ss === "rating") {
+      ss = "title";
+      try { localStorage.setItem("mn.sort", ss); } catch (_) {}
+    }
     if (ss) { state.sort = ss; if (E.sort) E.sort.value = ss; }
     const sa = localStorage.getItem("mn.sortasc");
     if (sa != null) state.sortAsc = sa === "1";
@@ -3888,7 +3924,7 @@
     { key: "year",   label: "Year",   w: "62px" },
     { key: "genre",  label: "Genre",  w: "minmax(90px,1fr)" },
     { key: "dur",    label: "Time",   w: "68px" },
-    { key: "rating", label: "Rating", w: "152px" },
+    { key: "like",   label: "Like",   w: "64px" },
   ];
   let hiddenCols = [];
   try { hiddenCols = JSON.parse(localStorage.getItem("mn.hiddencols") || "[]"); } catch (_) {}
@@ -4278,7 +4314,17 @@
     E.stemEnable.checked = !!m.stems_enabled;
     E.stemPass.checked = !!m.stems_passthrough;
     E.btnStems.classList.toggle("active", !!m.stems_enabled);
+    /* compact (mini/micro) mixer mirrors the same two switches, and hides
+       itself for radio/podcasts — C zeroes stems_available/stems_enabled for
+       an online source, so there is nothing to mix (mn_app_now_impl) */
+    msSyncSwitches(m);
     updateDetailsRow(m);
+    /* An audiobook's album IS its title, so the widget's third line just
+       repeats the second-largest text. Marked here, hidden by CSS in the
+       small tiers only — the full desktop panel is untouched. */
+    E.npAlbum.classList.toggle("dupe-title",
+      !!m.track_album && String(m.track_album).trim().toLowerCase()
+                      === String(m.track_title || "").trim().toLowerCase());
 
     if (state.view === 0) refreshPlayingRow();
   });
@@ -4850,7 +4896,9 @@
     /* the canvas lives in the now-playing panel — when that is collapsed the
        bars are invisible, so the loop + its 20 Hz bridge polling must PARK
        (they used to run forever while "listening + browsing the library") */
-    const visible = () => !lowPower() && !window.__mnWinHidden &&
+    /* …and the widget tiers hide the canvas entirely, so the loop and its
+       20 Hz bridge poll park there too (tap("now") re-wakes on the way out) */
+    const visible = () => !lowPower() && !window.__mnWinHidden && !uiSmallTier &&
                           !E.app.classList.contains("np-collapsed");
     function frame(ts) {
       raf = 0;
@@ -6002,7 +6050,17 @@
   /* clear-cache acknowledgment: refresh anything showing the cleared data */
   on("cachecleared", (m) => {
     const which = m.which || "";
-    if (typeof window.__mnToast === "function") window.__mnToast("Cache cleared — regenerating in background");
+    if (typeof window.__mnToast === "function") {
+      // Stems are the one cache that does NOT regenerate in the background:
+      // a separation only happens when its track is played.
+      window.__mnToast(which === "stems"
+        ? "Stem cache cleared — tracks re-separate on next play"
+        : "Cache cleared — regenerating in background");
+    }
+    {   // restore the mixer's button whatever the outcome
+      const cb = $("#stem-clearcache");
+      if (cb) { cb.disabled = false; cb.textContent = "Clear cache"; }
+    }
     if (which === "art" || which === "webart") {
       state.albDirty = true;
       if (state.view === 1) { state.albDirty = false; resetAlbums(true); loadAlbums(); }
@@ -6657,6 +6715,15 @@
      STEM DOCK (always visible; collapsible to a slim bar)
      ============================================================ */
   const faderEls = [];
+  /* Element refs for the MINI/MICRO compact stem strip. Declared up here (and
+     populated lazily by msBuild()) so the shared writers below — setFaderGain,
+     paintStemChan, setStemMaster — can mirror into it without a temporal-dead-
+     zone hazard, whatever order things run in. Empty until first open. */
+  const msEls = {};
+  let msOpen = false;      /* sheet expanded?  (persisted: mn.ministems)   */
+  let msBuilt = false;     /* channel grid materialised yet?               */
+  let msLive = false;      /* neural mixer actually producing signal        */
+  let msOnline = false;    /* radio/podcast playing -> no stems at all      */
   /* channel-family tint for the name dot (see .fader[data-group=…] in CSS).
      Channel order: 0 Sub, 1 Bass, 2 Vocals, 3 Lead, 4 Instruments, 5 Wide,
      6 Air, 7 Guitar, 8 Piano. */
@@ -6683,13 +6750,55 @@
     const rec = faderEls[i];
     if (rec) rec.sendG(clamp(rec.gain * stemMaster, 0, 1));
   }
+  /* THE single writer for a channel's gain. Both mixers (the desktop dock and
+     the mini/micro compact strip) are painted from here, so a drag in either
+     one is already reflected in the other — resizing the window never shows a
+     stale fader, because there is only ever one value and one paint path. */
   function setFaderGain(rec, i, pctVal, sendIt) {
     const p = clamp(Math.round(pctVal), 0, 100);
     rec.gain = p / 100;
-    rec.track.style.setProperty("--p", (p / 100).toFixed(3));
+    const f = (p / 100).toFixed(3);
+    rec.track.style.setProperty("--p", f);
     rec.track.setAttribute("aria-valuenow", String(p));
     rec.pct.textContent = p + "%";
+    if (rec.mini) {                       /* compact strip, once it is built */
+      rec.mini.track.style.setProperty("--p", f);
+      rec.mini.track.setAttribute("aria-valuenow", String(p));
+      rec.mini.track.title = STEM_NAMES[i] + " — " + p + "%";
+    }
     if (sendIt !== false) pushGain(i);
+  }
+  /* Mute/solo paint for BOTH mixers — same reasoning as setFaderGain. */
+  function paintStemChan(rec) {
+    const muted = !rec.on;
+    rec.root.classList.toggle("muted", muted);
+    rec.mute.classList.toggle("active", muted);
+    rec.mute.setAttribute("aria-pressed", String(muted));
+    rec.solo.classList.toggle("active", rec.soloed);
+    rec.solo.setAttribute("aria-pressed", String(rec.soloed));
+    const m = rec.mini;
+    if (!m) return;
+    m.root.classList.toggle("muted", muted);
+    m.mute.classList.toggle("active", muted);
+    m.mute.setAttribute("aria-pressed", String(muted));
+    m.solo.classList.toggle("active", rec.soloed);
+    m.solo.setAttribute("aria-pressed", String(rec.soloed));
+  }
+  /* No-ops when the channel is already in the requested state — that is what
+     kept the preset macros from spamming the bridge, so it is preserved. */
+  function stemSetMute(i, muted, quiet) {
+    const rec = faderEls[i];
+    if (!rec || rec.on === !muted) return;
+    rec.on = !muted;
+    paintStemChan(rec);
+    if (!quiet) send({ cmd: "stems", action: "mute", i, on: !!muted });
+  }
+  function stemSetSolo(i, on, quiet) {
+    const rec = faderEls[i];
+    if (!rec || rec.soloed === !!on) return;
+    rec.soloed = !!on;
+    paintStemChan(rec);
+    if (!quiet) send({ cmd: "stems", action: "solo", i, on: !!on });
   }
   function buildFaders() {
     E.stemFaders.innerHTML = ""; faderEls.length = 0;
@@ -6813,19 +6922,12 @@
 
       mute.addEventListener("click", () => {
         if (stemDockState !== "live") return;   /* inert with the dock overlay */
-        rec.on = !rec.on;
-        root.classList.toggle("muted", !rec.on);
-        mute.classList.toggle("active", !rec.on);
-        mute.setAttribute("aria-pressed", String(!rec.on));
-        send({ cmd: "stems", action: "mute", i, on: !rec.on });
+        stemSetMute(i, rec.on);                 /* rec.on = audible → mute it */
         syncStemPresetChips();
       });
       solo.addEventListener("click", () => {
         if (stemDockState !== "live") return;   /* inert with the dock overlay */
-        rec.soloed = !rec.soloed;
-        solo.classList.toggle("active", rec.soloed);
-        solo.setAttribute("aria-pressed", String(rec.soloed));
-        send({ cmd: "stems", action: "solo", i, on: rec.soloed });
+        stemSetSolo(i, !rec.soloed);
         syncStemPresetChips();
       });
       faderEls.push(rec);
@@ -6863,6 +6965,12 @@
       /* knob rail reads --p and moves via transform (compositor-only) */
       m.track.style.setProperty("--p", (p / 100).toFixed(3));
       m.track.setAttribute("aria-valuenow", String(p));
+    }
+    /* mirror onto the compact strip's master (built lazily; may be absent) */
+    if (msEls.mFill) {
+      msEls.mFill.style.transform = "scaleX(" + (p / 100).toFixed(3) + ")";
+      msEls.mVal.textContent = String(p);
+      msEls.mTrack.setAttribute("aria-valuenow", String(p));
     }
     if (sendIt !== false) pushAllGains(p);
   }
@@ -6942,21 +7050,8 @@
     if (!p) return;
     const set = new Set(p.keep);
     faderEls.forEach((rec, i) => {
-      const shouldBeOn = set.has(i);
-      if (rec.on !== shouldBeOn) {
-        rec.on = shouldBeOn;
-        rec.root.classList.toggle("muted", !rec.on);
-        rec.mute.classList.toggle("active", !rec.on);
-        rec.mute.setAttribute("aria-pressed", String(!rec.on));
-        send({ cmd: "stems", action: "mute", i, on: !rec.on });
-      }
-      /* clear any solos so the preset's mute mask is what plays */
-      if (rec.soloed) {
-        rec.soloed = false;
-        rec.solo.classList.remove("active");
-        rec.solo.setAttribute("aria-pressed", "false");
-        send({ cmd: "stems", action: "solo", i, on: false });
-      }
+      stemSetMute(i, !set.has(i));
+      stemSetSolo(i, false);   /* clear solos so the mute mask is what plays */
     });
     syncStemPresetChips();
   }
@@ -6967,19 +7062,8 @@
     setStemMaster(100, false);
     faderEls.forEach((rec, i) => {
       setFaderGain(rec, i, 100);
-      if (!rec.on) {
-        rec.on = true;
-        rec.root.classList.remove("muted");
-        rec.mute.classList.remove("active");
-        rec.mute.setAttribute("aria-pressed", "false");
-        send({ cmd: "stems", action: "mute", i, on: false });
-      }
-      if (rec.soloed) {
-        rec.soloed = false;
-        rec.solo.classList.remove("active");
-        rec.solo.setAttribute("aria-pressed", "false");
-        send({ cmd: "stems", action: "solo", i, on: false });
-      }
+      stemSetMute(i, false);
+      stemSetSolo(i, false);
     });
     syncStemPresetChips();
   }
@@ -6987,8 +7071,10 @@
      audible set (solo overrides mute, matching engine routing) after every
      change, so the highlight can never go stale; no match = no highlight. */
   function syncStemPresetChips() {
-    const row = $("#stem-presets");
-    if (!row) return;
+    /* both chip rows — the dock's and the mini/micro strip's (when built).
+       One derivation, painted twice, so the two can never disagree. */
+    const rows = [$("#stem-presets"), $("#ms-presets")].filter(Boolean);
+    if (!rows.length) return;
     const anySolo = faderEls.some((r) => r.soloed);
     const audible = [];
     faderEls.forEach((r, i) => { if (anySolo ? r.soloed : r.on) audible.push(i); });
@@ -6997,8 +7083,10 @@
     for (const name of Object.keys(STEM_PRESETS)) {
       if (STEM_PRESETS[name].keep.join(",") === key) { match = name; break; }
     }
-    row.querySelectorAll(".stem-preset-chip").forEach((c) => {
-      c.classList.toggle("applied", !!match && c.dataset.preset === match);
+    rows.forEach((row) => {
+      row.querySelectorAll(".stem-preset-chip").forEach((c) => {
+        c.classList.toggle("applied", !!match && c.dataset.preset === match);
+      });
     });
   }
   function buildStemPresets() {
@@ -7068,18 +7156,36 @@
     }
   }
   let smLastTs = 0;
+  /* Which meter surfaces are actually ON SCREEN this frame. The ballistics
+     (meterDisp / peakDisp) always advance — metersAnimating() reads them to
+     decide when the shared rAF loop may park, so freezing them would pin the
+     loop awake forever — but the DOM WRITES are gated:
+       · dock  — display:none in mini/micro, so its 18 style writes/frame are
+                 pure waste there;
+       · mini  — only while the compact sheet is open AND stems are actually
+                 producing signal (see msMetersLive()).
+     When neither is visible the loop does arithmetic only: zero style
+     invalidation, zero paint. On a visibility flip the per-fader memos are
+     invalidated once so the first visible frame repaints from scratch. */
+  let mtDockVis = true, mtMiniVis = false;
   function smoothMeters(ts) {
     /* frame-delta so peak decay is refresh-rate independent (0.3/s = the old
        0.005/frame at 60 Hz); clamp covers rAF parking/resume gaps */
     const dt = smLastTs ? Math.min(0.1, Math.max(0, (ts - smLastTs) / 1000)) : 1 / 60;
     smLastTs = ts;
+    const dockVis = !uiSmallTier;          /* full/compact: dock is on screen */
+    const miniVis = msMetersLive();
+    if (dockVis !== mtDockVis || miniVis !== mtMiniVis) {
+      mtDockVis = dockVis; mtMiniVis = miniVis;
+      for (const f of faderEls) { f._lastS = -1; f._lastPk = null; f._lastMS = -1; }
+    }
     for (const f of faderEls) {
       const t = f.meterVal;
       f.meterDisp += (t - f.meterDisp) * (t > f.meterDisp ? 0.5 : 0.12);
       const s = Math.max(0, Math.min(1, f.meterDisp / 100));
       /* transform (compositor-only, no layout) instead of height %; skip
          near-identical frames to avoid needless style writes */
-      if (Math.abs(s - (f._lastS || -1)) > 0.004) {
+      if (dockVis && Math.abs(s - (f._lastS || -1)) > 0.004) {
         f._lastS = s;
         f.mfill.style.transform = "scaleY(" + s.toFixed(3) + ")";
       }
@@ -7088,9 +7194,16 @@
          writes stop entirely once the peak settles (idle-safe). */
       f.peakDisp = Math.max(s, f.peakDisp - 0.3 * dt);
       const py = (1 - f.peakDisp) * 100;
-      if (Math.abs(py - (f._lastPk == null ? -1 : f._lastPk)) > 0.45) {
+      if (dockVis && Math.abs(py - (f._lastPk == null ? -1 : f._lastPk)) > 0.45) {
         f._lastPk = py;
         f.mpeak.style.transform = "translateY(" + py.toFixed(1) + "%)";
+      }
+      /* compact strip: ONE write per channel (the meter tint behind the
+         micro-fader). No peak-hold — a 52px-tall bar cannot show it, and
+         skipping it halves the widget's per-frame write count. */
+      if (miniVis && f.mini && Math.abs(s - (f._lastMS == null ? -1 : f._lastMS)) > 0.008) {
+        f._lastMS = s;
+        f.mini.meter.style.transform = "scaleY(" + s.toFixed(3) + ")";
       }
     }
   }
@@ -7124,6 +7237,7 @@
       : "live";
     if (s === stemDockState || !stemOv.root) return;
     stemDockState = s;
+    msPaintState(s);          /* compact strip mirrors the same 4 states */
     const showOv = s !== "live";
     stemOv.root.hidden = !showOv;
     if (stemOv.body) stemOv.body.classList.toggle("inert", showOv);
@@ -7160,6 +7274,12 @@
     if (E.stemStatus.textContent !== txt) E.stemStatus.textContent = txt;
     E.stemStatus.classList.toggle("live", active && m.stems_enabled && !m.stems_passthrough);
     E.stemStatus.classList.toggle("loading", loading);
+    /* the compact strip's one-line status — only while its sheet is open, so
+       a collapsed widget costs nothing per poll */
+    if (msOpen && msEls.status && msEls.status.textContent !== txt) msEls.status.textContent = txt;
+    /* the "Stems" toggle glows when the neural mixer is genuinely live; that
+       is the only thing the COLLAPSED widget paints, and only on a flip */
+    msSetLive(!!(active && m.stems_enabled && !m.stems_passthrough));
     updateStemDockState(m);
     /* general-purpose activity strip: show live stem separation progress
        (priority 4 — it's the foreground thing the user just asked for).
@@ -7189,6 +7309,23 @@
     syncStemCollapseBtn(collapsed);
     localStorage.setItem("mn.stemdock", collapsed ? "min" : "open");
   });
+  /* Clear cached separations, from the mixer rather than only from
+     Settings -> Storage. The cache is keyed by track id ALONE and carries no
+     model identity, so a track separated by an earlier model keeps replaying
+     that model's stems forever -- switching the stems model does nothing
+     visible until the cache is cleared. That makes this belong next to the
+     mixer, where the model is actually being judged. */
+  {
+    const cb = $("#stem-clearcache");
+    if (cb) cb.addEventListener("click", () => {
+      if (!confirm("Delete every cached separation?\n\nTracks will re-separate "
+                   + "on next play, which takes time but picks up the "
+                   + "currently selected stems model.")) return;
+      cb.disabled = true;
+      cb.textContent = "Clearing…";
+      send({ cmd: "clearcache", which: "stems" });
+    });
+  }
   if (localStorage.getItem("mn.stemdock") === "min") {
     E.stemDock.classList.add("collapsed");
     syncStemCollapseBtn(true);
@@ -7271,6 +7408,363 @@
   E.stemDock.addEventListener("pointerleave", () => { dockActive = false; dockLastTs = performance.now(); });
   E.stemDock.addEventListener("pointerdown", () => { dockLastTs = performance.now(); });
   armDockIdle();
+
+  /* ============================================================
+     COMPACT STEM MIXER  —  the mini / micro tiers
+     ------------------------------------------------------------
+     The dock above is ~238px of chrome; a widget has none to give.
+     This is a SECOND VIEW of the SAME mixer, not a second mixer:
+     every control here calls the shared writers defined with the
+     dock (setFaderGain / stemSetMute / stemSetSolo / setStemMaster
+     / applyStemPreset / resetStemMixer), and those writers paint
+     BOTH surfaces. Consequences that matter:
+
+       · Two-way sync is structural, not a sync routine. Shrink the
+         window mid-mix and the compact strip is already right;
+         mute a channel in the widget, grow the window, and the
+         dock's M button is already lit. Nothing can drift because
+         nothing is duplicated.
+       · Engine traffic is unchanged — the same throttled senders,
+         the same "only send on a real change" guards.
+
+     WHAT EACH TIER SHOWS, and why:
+       MINI  a 9-column strip of micro-faders. Each column is one
+             52px vertical fader with the channel's METER painted
+             INSIDE the track (the dock spends a second column on a
+             separate meter; at 33px per channel there is no second
+             column), the abbreviated name, and an M | S pair. That
+             is the entire mixer — level, mute, solo, per channel —
+             plus the preset chips, the AI switch, the neural/
+             original toggle and the master. The grid is auto-fit,
+             so on a 360px window it simply wraps to two rows
+             instead of shaving the faders below usable width.
+       MICRO faders drop out and the grid becomes 3-up name + M | S
+             rows in a full-cover sheet. Below 360px a fader would
+             be ~24px wide with ~26px of travel — that is a control
+             you cannot aim at, and pretending otherwise is worse
+             than not offering it. Mute / solo / presets / master
+             still cover everything you actually reach for on a
+             widget, and the master keeps level control.
+
+     IDLE-CPU CONTRACT: the strip is COLLAPSED by default and the
+     meters only animate while the sheet is open AND the neural
+     mixer is genuinely producing signal (msMetersLive, consumed by
+     smoothMeters). Collapsed, or stems off, or paused: zero DOM
+     writes. Nothing here polls or holds a timer.
+     ============================================================ */
+  const MS_KEY = "mn.ministems";
+  /* 3–4 char channel labels — the full names never fit at 33px */
+  const STEM_ABBR = ["SUB", "BASS", "VOX", "LEAD", "INST", "WIDE", "AIR", "GTR", "PNO"];
+  const msRoot = $("#ministems");
+
+  /* Meters are the only per-frame cost in the widget; this is the gate. */
+  function msMetersLive() {
+    if (!msOpen || !msBuilt || !uiSmallTier || msOnline) return false;
+    const n = state.now;
+    return !!(n && n.playing && n.stems_enabled && !n.stems_passthrough && n.neural_active);
+  }
+
+  /* collapsed-state affordance: the toggle glows while the neural mixer is
+     actually live, so you can tell at a glance without opening anything */
+  function msSetLive(on) {
+    if (!msRoot || msLive === !!on) return;
+    msLive = !!on;
+    msRoot.classList.toggle("live", msLive);
+  }
+
+  /* mirror the dock's 4-state machine (off / loading / none / live) */
+  function msPaintState(s) {
+    if (!msEls.body) return;
+    const inert = s !== "live";
+    msEls.body.classList.toggle("inert", inert);
+    const note = msEls.note;
+    if (!inert) { note.hidden = true; note.textContent = ""; return; }
+    note.hidden = false;
+    note.textContent =
+      s === "loading" ? "Loading neural model…" :
+      s === "none"    ? "Stem engine unavailable — original audio is playing." :
+                        "AI Stems are off.";
+    if (s === "off") {
+      const b = el("button", "ms-en", "Enable");
+      b.addEventListener("click", () => send({ cmd: "stems", action: "enable", on: true }));
+      note.appendChild(b);
+    }
+  }
+
+  /* switches + the online gate, off the 4 Hz now payload (memoised block) */
+  function msSyncSwitches(m) {
+    const online = !!(m && m.online);
+    if (online !== msOnline) {
+      msOnline = online;
+      if (msRoot) msRoot.classList.toggle("ms-off", online);
+      if (online && msOpen) msSetOpen(false, false);   /* nothing to show */
+    }
+    if (!msBuilt) return;
+    msEls.enable.checked = !!(m && m.stems_enabled);
+    const pass = !!(m && m.stems_passthrough);
+    msEls.pass.classList.toggle("active", !pass);
+    msEls.pass.setAttribute("aria-pressed", pass ? "false" : "true");
+    msEls.pass.textContent = pass ? "ORIGINAL" : "NEURAL";
+  }
+
+  /* ---- one channel cell: micro-fader (meter inside the track) + M | S ---- */
+  function msBuildChannel(i) {
+    const rec = faderEls[i];
+    if (!rec) return null;
+    const root = el("div", "ms-ch");
+    root.dataset.group = STEM_GROUPS[i];
+    const name = el("div", "ms-ch-name", STEM_ABBR[i]);
+    name.title = STEM_NAMES[i];
+    root.appendChild(name);
+
+    const track = el("div", "ms-fader");
+    track.tabIndex = 0;
+    track.setAttribute("role", "slider");
+    track.setAttribute("aria-orientation", "vertical");
+    track.setAttribute("aria-label", STEM_NAMES[i] + " level");
+    track.setAttribute("aria-valuemin", "0");
+    track.setAttribute("aria-valuemax", "100");
+    const meter = el("div", "ms-meter");     /* live energy, behind the fill */
+    track.appendChild(meter);
+    track.appendChild(el("div", "ms-fill"));
+    track.appendChild(el("div", "ms-thumb"));
+    root.appendChild(track);
+
+    const btns = el("div", "ms-btns");
+    const mute = el("button", "fader-mute ms-btn", "M");
+    mute.title = "Mute " + STEM_NAMES[i];
+    mute.setAttribute("aria-label", "Mute " + STEM_NAMES[i]);
+    mute.setAttribute("aria-pressed", "false");
+    const solo = el("button", "fader-solo ms-btn", "S");
+    solo.title = "Solo " + STEM_NAMES[i];
+    solo.setAttribute("aria-label", "Solo " + STEM_NAMES[i]);
+    solo.setAttribute("aria-pressed", "false");
+    btns.appendChild(mute); btns.appendChild(solo);
+    root.appendChild(btns);
+
+    rec.mini = { root, track, meter, mute, solo };
+
+    /* Same interaction contract as the dock's vfader, same state functions:
+       drag commits live, a BARE click's engine send is deferred ~250ms so the
+       first press of a double-click reset never audibly passes through. */
+    const valFromEvent = (ev) => {
+      const r = track.getBoundingClientRect();
+      return (1 - clamp((ev.clientY - r.top) / Math.max(1, r.height), 0, 1)) * 100;
+    };
+    let dragMoved = false, clickSendT = 0;
+    track.addEventListener("pointerdown", (ev) => {
+      if (ev.button !== 0 || stemDockState !== "live") return;
+      ev.stopPropagation();
+      if (ev.detail > 1) return;
+      if (clickSendT) { clearTimeout(clickSendT); clickSendT = 0; }
+      track.setPointerCapture(ev.pointerId);
+      dragMoved = false;
+      setFaderGain(rec, i, valFromEvent(ev), false);
+    });
+    track.addEventListener("pointermove", (ev) => {
+      if (!track.hasPointerCapture(ev.pointerId)) return;
+      dragMoved = true;
+      setFaderGain(rec, i, valFromEvent(ev));
+    });
+    track.addEventListener("pointerup", (ev) => {
+      if (!track.hasPointerCapture(ev.pointerId)) return;
+      track.releasePointerCapture(ev.pointerId);
+      if (dragMoved) { pushGain(i); return; }
+      clickSendT = setTimeout(() => { clickSendT = 0; pushGain(i); }, 250);
+    });
+    track.addEventListener("dblclick", () => {
+      if (clickSendT) { clearTimeout(clickSendT); clickSendT = 0; }
+      if (stemDockState === "live") setFaderGain(rec, i, 100);
+    });
+    track.addEventListener("wheel", (ev) => {
+      ev.preventDefault();
+      if (stemDockState !== "live") return;
+      setFaderGain(rec, i, rec.gain * 100 + (ev.deltaY < 0 ? 4 : -4));
+    }, { passive: false });
+    track.addEventListener("keydown", (ev) => {
+      if (stemDockState !== "live") return;
+      const cur = rec.gain * 100, k = ev.key;
+      let v = null;
+      if (k === "ArrowUp" || k === "ArrowRight") v = cur + (ev.shiftKey ? 10 : 2);
+      else if (k === "ArrowDown" || k === "ArrowLeft") v = cur - (ev.shiftKey ? 10 : 2);
+      else if (k === "Home") v = 0;
+      else if (k === "End") v = 100;
+      else if (k === "m" || k === "M") { ev.preventDefault(); mute.click(); return; }
+      else if (k === "s" || k === "S") { ev.preventDefault(); solo.click(); return; }
+      if (v == null) return;
+      ev.preventDefault();
+      setFaderGain(rec, i, v);
+    });
+
+    mute.addEventListener("click", () => {
+      if (stemDockState !== "live") return;
+      stemSetMute(i, rec.on);
+      syncStemPresetChips();
+    });
+    solo.addEventListener("click", () => {
+      if (stemDockState !== "live") return;
+      stemSetSolo(i, !rec.soloed);
+      syncStemPresetChips();
+    });
+    return root;
+  }
+
+  /* Built once, on first open — a widget that is never opened costs one
+     button's worth of DOM. Seeds every control from the CURRENT mixer state
+     so opening it mid-track shows exactly what the dock shows. */
+  function msBuild() {
+    if (msBuilt || !msRoot || !faderEls.length) return;
+    msBuilt = true;
+    msEls.sheet   = $("#ms-sheet");
+    msEls.body    = $("#ms-body");
+    msEls.note    = $("#ms-note");
+    msEls.status  = $("#ms-status");
+    msEls.enable  = $("#ms-enable");
+    msEls.pass    = $("#ms-pass");
+    msEls.chans   = $("#ms-chans");
+    msEls.mTrack  = $("#ms-master-track");
+    msEls.mFill   = $("#ms-master-fill");
+    msEls.mVal    = $("#ms-master-val");
+
+    /* preset chips — same STEM_PRESETS, same applyStemPreset/resetStemMixer,
+       so the highlight logic in syncStemPresetChips covers this row too */
+    const prow = $("#ms-presets");
+    prow.innerHTML = "";
+    Object.keys(STEM_PRESETS).forEach((name) => {
+      const chip = el("button", "stem-preset-chip", name);
+      chip.dataset.preset = name;
+      chip.title = STEM_PRESETS[name].tip;
+      chip.addEventListener("click", () => applyStemPreset(name));
+      prow.appendChild(chip);
+    });
+    { const rst = el("button", "stem-preset-chip stem-reset-chip", "Reset");
+      rst.title = "All channels to 100%, unmuted, no solos; master back to 100%";
+      rst.addEventListener("click", resetStemMixer);
+      prow.appendChild(rst); }
+
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < faderEls.length; i++) {
+      const cell = msBuildChannel(i);
+      if (cell) frag.appendChild(cell);
+    }
+    msEls.chans.appendChild(frag);
+
+    msEls.enable.addEventListener("change", () =>
+      send({ cmd: "stems", action: "enable", on: msEls.enable.checked }));
+    /* the pill reads NEURAL / ORIGINAL — the inverse of passthrough, which is
+       the way the feature is actually thought about */
+    msEls.pass.addEventListener("click", () => {
+      const nowPass = !!(state.now && state.now.stems_passthrough);
+      send({ cmd: "stems", action: "passthrough", on: !nowPass });
+    });
+    $("#ms-close").addEventListener("click", () => msSetOpen(false));
+
+    /* master: one horizontal track, driving the shared setStemMaster */
+    { const mt = msEls.mTrack;
+      let rect = null;   /* cached at pointerdown — no layout read per move */
+      const mv = (ev) => {
+        const r = rect || (rect = mt.getBoundingClientRect());
+        return clamp((ev.clientX - r.left) / Math.max(1, r.width), 0, 1) * 100;
+      };
+      mt.addEventListener("pointerdown", (ev) => {
+        if (ev.button !== 0 || stemDockState !== "live") return;
+        mt.setPointerCapture(ev.pointerId);
+        rect = mt.getBoundingClientRect();
+        setStemMaster(mv(ev), false);          /* visual only until move/up */
+      });
+      mt.addEventListener("pointermove", (ev) => {
+        if (!mt.hasPointerCapture(ev.pointerId)) return;
+        setStemMaster(mv(ev));
+      });
+      mt.addEventListener("pointerup", (ev) => {
+        if (!mt.hasPointerCapture(ev.pointerId)) return;
+        mt.releasePointerCapture(ev.pointerId);
+        rect = null;
+        setStemMaster(stemMaster * 100);       /* authoritative trailing send */
+      });
+      mt.addEventListener("lostpointercapture", () => { rect = null; });
+      mt.addEventListener("dblclick", () => { if (stemDockState === "live") setStemMaster(100); });
+      mt.addEventListener("wheel", (ev) => {
+        ev.preventDefault();
+        if (stemDockState !== "live") return;
+        setStemMaster(stemMaster * 100 + (ev.deltaY < 0 ? 4 : -4));
+      }, { passive: false });
+      mt.addEventListener("keydown", (ev) => {
+        if (stemDockState !== "live") return;
+        const cur = stemMaster * 100;
+        let v = null;
+        if (ev.key === "ArrowUp" || ev.key === "ArrowRight") v = cur + (ev.shiftKey ? 10 : 2);
+        else if (ev.key === "ArrowDown" || ev.key === "ArrowLeft") v = cur - (ev.shiftKey ? 10 : 2);
+        else if (ev.key === "Home") v = 0;
+        else if (ev.key === "End") v = 100;
+        if (v == null) return;
+        ev.preventDefault();
+        setStemMaster(v);
+      });
+    }
+
+    /* seed every control from the live mixer state (visual only, no sends) */
+    faderEls.forEach((rec, i) => { setFaderGain(rec, i, rec.gain * 100, false); paintStemChan(rec); });
+    setStemMaster(stemMaster * 100, false);
+    syncStemPresetChips();
+    msPaintState(stemDockState || "off");
+    msSyncSwitches(state.now);
+  }
+
+  /* ---- open / close ------------------------------------------------------
+     Dismissible three ways (the toggle, ✕, Esc) plus a click outside in mini.
+     Deliberately NO focus trap and no autofocus: this is a widget panel, not
+     a modal — Tab walks straight out of it. */
+  function msOutside(ev) {
+    if (!msRoot || msRoot.contains(ev.target)) return;
+    msSetOpen(false);
+  }
+  function msEsc(ev) {
+    if (ev.key !== "Escape" || !msOpen) return;
+    msSetOpen(false);
+    if (msEls.toggle) msEls.toggle.focus();
+  }
+  function msSetOpen(open, persist) {
+    open = !!open && !msOnline;
+    if (open) { msBuild(); if (!msBuilt) return; }   /* faders not up yet */
+    if (open === msOpen) return;
+    msOpen = open;
+    if (msRoot) msRoot.classList.toggle("open", open);
+    const tog = $("#ms-toggle"), sheet = $("#ms-sheet");
+    if (tog) tog.setAttribute("aria-expanded", String(open));
+    if (sheet) sheet.hidden = !open;
+    if (open) {
+      /* listeners exist ONLY while the sheet is open — nothing to pay at idle */
+      document.addEventListener("pointerdown", msOutside, true);
+      document.addEventListener("keydown", msEsc);
+      msSyncSwitches(state.now);
+      msPaintState(stemDockState || "off");
+      if (msEls.status && state.now) updateStemStatus(state.now);
+      wakeLoop();                       /* meters may need to start painting */
+    } else {
+      document.removeEventListener("pointerdown", msOutside, true);
+      document.removeEventListener("keydown", msEsc);
+    }
+    if (persist !== false) {
+      try { localStorage.setItem(MS_KEY, open ? "open" : "min"); } catch (_) {}
+    }
+  }
+  if (msRoot) {
+    msEls.toggle = $("#ms-toggle");
+    msEls.toggle.addEventListener("click", () => msSetOpen(!msOpen));
+  }
+  /* Called by initUiTiers when the tier crosses the widget boundary. Restores
+     the remembered open/closed choice the first time a widget tier is
+     entered (which is always AFTER buildFaders(), so the channel records the
+     compact strip mirrors already exist), and collapses on the way out so a
+     re-shrink starts from the user's choice rather than a stale sheet. */
+  function msTierChanged(small) {
+    if (!msRoot) return;
+    if (!small) { msSetOpen(false, false); return; }
+    let want = "min";
+    try { want = localStorage.getItem(MS_KEY) || "min"; } catch (_) {}
+    if (want === "open") msSetOpen(true, false);
+  }
 
   /* ============================================================
      MODULE API — the shared bridge surface handed to the UI
@@ -8259,13 +8753,141 @@
      — already-imported names are skipped, so this is cheap on every boot). */
   setTimeout(() => send({ cmd: "importplaylists" }), 2500);
 
+  /* ============================================================
+     ADAPTIVE SIZE TIERS — shrink the window, get a widget
+     ------------------------------------------------------------
+     Everything visual lives in styles.css (the block at the very
+     bottom, keyed on html[data-ui-tier]). This is the ~only~ JS
+     the feature needs, and it does four things:
+
+       1. Stamps data-ui-tier on <html>. One attribute instead of
+          the same four breakpoints repeated across a hundred
+          selectors — and, crucially, an attribute on <html> gives
+          the tier rules a specificity of (1,1,1), which BEATS the
+          existing `#app.np-collapsed` (1,1,0) grid override AND
+          side-steps the --side-w / --np-w custom properties that
+          resizers.js writes inline on <html>. A media query that
+          only re-set those variables would lose to the inline
+          declaration; overriding grid-template outright cannot.
+       2. Parks the GPU/CPU work that has no place in a widget:
+          the volumetric cover mesh, the CSS tilt loop, the FFT
+          spectrum, Cover Flow's mesh, and the fullscreen cover.
+       3. Copies each nav item's label into its title= so the
+          COMPACT icon rail (font-size:0 — the labels are bare
+          text nodes and no selector can reach them) still names
+          its buttons on hover. Runs once, and it improves the
+          full-size sidebar too.
+       4. Owns the mini-only keep-on-top pin.
+
+     Cost at idle: zero. It piggybacks the ResizeObserver that
+     already exists for body.resizing (see initResizeMarker), does
+     two window reads, and returns early unless the tier actually
+     changed. No polling, no second observer, no timers.
+     ============================================================ */
+  (function initUiTiers() {
+    const root = document.documentElement;
+
+    /* Chosen from the real layout metrics, not round numbers:
+         1180w the breakpoint that ALREADY hid the now-playing column, kept
+               verbatim so the desktop layout does not regress by a pixel.
+          620h topbar 66 + player 150 + a usable ~400px of content.
+          780w MEASURED floor for a browsable window: sidebar rail 64 +
+               the recomposed player bar (icon-only volume ~146 + centre
+               transport 240 + gaps/padding 48) still leaves ~340px for the
+               track title and the list. Below it the topbar and the
+               transport start clipping each other, so the window is more
+               useful as a player than as a browser — hence straight to mini.
+          460h condensed topbar 56 + collapsed stem dock 44 + player 104 +
+               ~250px of list.
+          360w/320h  below this even the stacked hero has no room: the meta
+               + transport + seek chrome alone is ~140px tall, and three
+               transport buttons plus the two times need ~200px wide. */
+    function tierOf(w, h) {
+      if (w < 360 || h < 320)  return "micro";
+      if (w < 780 || h < 460)  return "mini";
+      if (w < 1180 || h < 620) return "compact";
+      return "full";
+    }
+
+    /* ---- keep-on-top pin (mini/micro only) ---- */
+    const PIN_KEY = "mn.ontop";
+    const pin = $("#btn-ontop");
+    let wantTop = false;
+    try { wantTop = localStorage.getItem(PIN_KEY) === "1"; } catch (_) {}
+    let sentTop = null;
+    /* The C side may not implement {cmd:"alwaystop"} yet — an unknown cmd is
+       simply ignored by the bridge, so this fails harmlessly either way. */
+    function pushTop(on) {
+      on = !!on;
+      if (sentTop === on) return;
+      sentTop = on;
+      try { send({ cmd: "alwaystop", on }); } catch (_) {}
+    }
+    function paintPin() {
+      if (!pin) return;
+      pin.classList.toggle("on", wantTop);
+      pin.setAttribute("aria-pressed", wantTop ? "true" : "false");
+      pin.title = wantTop ? "Keep window on top — ON" : "Keep window on top";
+    }
+    if (pin) pin.addEventListener("click", () => {
+      wantTop = !wantTop;
+      try { localStorage.setItem(PIN_KEY, wantTop ? "1" : "0"); } catch (_) {}
+      paintPin();
+      pushTop(wantTop && uiSmallTier);
+    });
+    paintPin();
+
+    /* ---- icon-rail tooltips (one pass; also helps the full sidebar) ---- */
+    function labelNavItems() {
+      $$("#nav .nav-item").forEach((b) => {
+        if (b.title) return;
+        const t = (b.textContent || "").trim();
+        if (t) b.title = t;
+      });
+    }
+    labelNavItems();
+    /* custom library kinds are injected later by on("kinds") */
+    tap("kinds", () => setTimeout(labelNavItems, 0));
+
+    let cur = "";
+    function apply() {
+      const t = tierOf(window.innerWidth, window.innerHeight);
+      if (t === cur) return;
+      cur = t;
+      root.setAttribute("data-ui-tier", t);
+
+      const small = (t === "mini" || t === "micro");
+      if (small === uiSmallTier) return;   /* compact <-> full: nothing else */
+      uiSmallTier = small;
+
+      if (small) {
+        /* a fixed fullscreen cover over a 300px window is nonsense */
+        if (artFullscreen) exitArtFullscreen();
+        cfHideMesh();                       /* Cover Flow's own WebGL mesh */
+      }
+      /* Re-evaluate the cover: on the way IN this takes the early-out branch
+         (mesh off, canvas hidden, flat cover made visible again); on the way
+         OUT it restores the volumetric/tilt cover for the current track. */
+      updateVolumetricArt(state._npArtUrl);
+      /* compact stem mixer: restore the remembered open/closed choice on the
+         way in, collapse on the way out (see msTierChanged) */
+      msTierChanged(small);
+      wakeLoop();
+
+      if (pin) pin.hidden = !small;
+      pushTop(small && wantTop);
+    }
+    apply();                    /* stamp the boot size before first paint */
+    uiTierApply = apply;        /* initResizeMarker's observer drives it */
+  })();
+
   poll();
 
   /* Register the core as a module block: other modules reach the bus and
      shared state ONLY through this api (see MODULES.md for the contract). */
   if (window.MN) MN.define("core", "2.8.0", ["motion", "custom", "artram"], function () {
     return {
-      send, on,
+      send, on, tap,
       state,
       refreshTracks: () => { resetTracks(); loadTracks(); },
       refreshAlbums: () => { resetAlbums(); loadAlbums(); },

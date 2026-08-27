@@ -74,8 +74,16 @@ typedef enum mn_status {
  *     computed when NULL (background backfill / scan), recomputed ONLY
  *     if the file SIZE changes (a genuinely different file). NULL =
  *     not yet computed; every consumer must treat NULL as "fall back
- *     to id/path" so the column is purely additive. */
-#define MN_SCHEMA_VERSION 7
+ *     to id/path" so the column is purely additive.
+ * v8: tracks.votes_updated_ms — epoch MILLISECONDS of the last LOCAL
+ *     like/dislike CHANGE (not ratings, not plays). 0 = never voted
+ *     locally. The vote-specific LWW clock the phone's merge requires
+ *     before it lets a peer CLEAR a vote: `updatedAt` moves on any
+ *     field change, so it cannot prove "this peer un-liked the track"
+ *     — votes_updated_ms can (HANDOFF-MONATOMIC.md in the Android
+ *     repo). Migration backfills every already-voted row so no vote
+ *     sits at stamp 0 (a 0 stamp would lose to ANY peer stamp). */
+#define MN_SCHEMA_VERSION 8
 
 /* Sentinel row id meaning "no row". */
 #define MN_INVALID_ID ((int64_t)0)
@@ -458,13 +466,15 @@ int32_t mn_library_folder_subtree(mn_library *lib, int64_t folder_id,
  *   stars (0..5)   -> tracks.rating_x2 (= stars*2),
  *   play_count     -> tracks.play_count (set directly; caller max-merged),
  *   last_played_ms -> tracks.last_played (converted ms -> unix SECONDS),
- *   updated_ms     -> tracks.pref_updated_ms.
+ *   updated_ms     -> tracks.pref_updated_ms,
+ *   votes_updated_ms -> tracks.votes_updated_ms (v8: the merged votes
+ *                     clock — the caller resolves it, this just writes).
  * Serialized.
  */
 mn_status mn_library_sync_apply(mn_library *lib, int64_t track_id,
                                 int liked, int disliked, int stars,
                                 int64_t play_count, int64_t last_played_ms,
-                                int64_t updated_ms);
+                                int64_t updated_ms, int64_t votes_updated_ms);
 
 /*
  * Bulk-enumerate the sync-relevant columns of tracks via one streaming query
@@ -473,17 +483,71 @@ mn_status mn_library_sync_apply(mn_library *lib, int64_t track_id,
  * streams only tracks carrying at least one NON-DEFAULT metric (liked != 0 OR
  * rating_x2 > 0 OR play_count > 0 OR last_played > 0 — the snapshot rule of
  * SYNC_PROTOCOL §2). `last_played` is in unix SECONDS (the stored unit);
- * `pref_updated_ms` in epoch milliseconds. cb is invoked per row; do not call
- * other library functions from inside it, and copy any strings you keep.
+ * `pref_updated_ms` / `votes_updated_ms` in epoch milliseconds. `content_hash`
+ * is the row's immutable content fingerprint (schema v7) or NULL when not yet
+ * computed — the NULL/non-NULL distinction is meaningful, do not map NULL
+ * to "". cb is invoked per row; do not call other library functions from
+ * inside it, and copy any strings you keep.
  */
 typedef void (*mn_library_sync_cb)(void *user, int64_t track_id,
                                    const char *artist, const char *title,
                                    const char *album, int64_t duration_ms,
                                    int32_t liked, int32_t rating_x2,
                                    int64_t play_count, int64_t last_played,
-                                   int64_t pref_updated_ms);
+                                   int64_t pref_updated_ms,
+                                   int64_t votes_updated_ms,
+                                   const char *content_hash);
 mn_status mn_library_sync_enumerate(mn_library *lib, bool all,
                                     mn_library_sync_cb cb, void *user);
+
+/* ------------------------------------------------------------------------- */
+/* Audiobook progress sync (additive v1 "books" snapshot section)            */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Bulk-enumerate every book_progress row joined with its chapter's tags via
+ * one streaming query under a single lock — the feed for the snapshot's
+ * "books" section. `content_hash` is the TRACK's current fingerprint,
+ * falling back to the hash snapshotted into the progress row (NULL when
+ * neither exists). `updated` is unix SECONDS (the stored unit — the sync
+ * layer converts to protocol milliseconds at the wire). Missing tracks are
+ * still enumerated: progress on a detached drive is progress worth syncing.
+ * cb rules are the same as mn_library_sync_cb's.
+ */
+typedef void (*mn_library_book_sync_cb)(void *user, int64_t album_id,
+                                        int64_t track_id,
+                                        const char *artist, const char *title,
+                                        const char *album, int64_t duration_ms,
+                                        const char *content_hash,
+                                        int64_t pos_ms, double percent,
+                                        bool finished, bool current,
+                                        int64_t updated);
+mn_status mn_library_book_sync_enumerate(mn_library *lib,
+                                         mn_library_book_sync_cb cb,
+                                         void *user);
+
+/*
+ * Apply ONE remote book-progress record to (album_id, track_id) with
+ * last-write-wins resolved HERE (unlike mn_library_book_note, which
+ * overwrites unconditionally): the write happens only when the row does not
+ * exist yet or `updated_s` (unix seconds) is strictly newer than the stored
+ * row's `updated`. `percent` is NOT taken from the wire — it is recomputed
+ * from the LOCAL album's chapter durations (the peer's chapter split may
+ * differ), exactly like mn_library_book_note. `finished` IS taken from the
+ * wire when `has_finished` (the peer's latch decision: a book finished
+ * there is finished here, and a rewind-cleared latch clears here too);
+ * otherwise the local latch rule runs on the recomputed percent.
+ * `want_current` marks the record as the peer's live resume chapter: the
+ * row is promoted to current=1 (demoting the album's other rows) only when
+ * `updated_s` also beats the album's newest current row — an older peer
+ * note never steals the resume target. *out_changed (optional) reports
+ * whether anything was written. Serialized.
+ */
+mn_status mn_library_book_sync_apply(mn_library *lib, int64_t album_id,
+                                     int64_t track_id, int64_t pos_ms,
+                                     bool has_finished, bool finished,
+                                     bool want_current, int64_t updated_s,
+                                     bool *out_changed);
 
 /* ------------------------------------------------------------------------- */
 /* Windowed query engine                                                     */

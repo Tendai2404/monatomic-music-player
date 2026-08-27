@@ -7,17 +7,23 @@
  *
  *   identity (§1)  — hand-rolled byte scanners, no regex: trim, lowercase
  *                    ASCII, collapse [\s._-]+ runs to one space, strip
- *                    ( .. ) / [ .. ] groups non-greedily, join with 0x01
- *                    separators + a 10-second duration bucket.
+ *                    ( .. ) / [ .. ] groups non-greedily, then concatenate
+ *                    artist+title+album+10-second-duration-bucket with NO
+ *                    separators (the Android wire format — see
+ *                    mn_sync_identity).
  *   snapshot (§2)  — walks the library (non-default metrics only) into a
  *                    malloc'd JSON string via a local strbuf.
- *   merge (§3)     — tolerant hand-rolled snapshot parse; identity -> local
- *                    track resolved through an FNV-1a open-addressing map
- *                    built from ONE bulk enumerate; max-merge play stats +
+ *   merge (§3)     — tolerant hand-rolled snapshot parse; remote record ->
+ *                    local track resolved through TWO FNV-1a open-addressing
+ *                    maps built from ONE bulk enumerate: the optional
+ *                    "hash" content fingerprint first (exact, retag-proof),
+ *                    then the tag identity; max-merge play stats +
  *                    last-write-wins preference group; changed rows written
  *                    through mn_library_sync_apply in ONE transaction.
  *   HTTP (§4a)     — WinHTTP, plain HTTP (the phone's LAN server), ~5 s
- *                    connect / ~10 s receive timeouts, 32 MB body cap.
+ *                    connect; per-request receive window (10 s ping,
+ *                    60 s snapshot, 120 s merge — a first sync on a
+ *                    big library keeps the phone busy), 32 MB cap.
  *   files (§4b)    — snapshot export/import in the shared JSON format.
  *
  * Library access goes through the caller-supplied mn_sync_env lock hooks;
@@ -151,8 +157,8 @@ static void sy_sb_putc(sy_strbuf *b, char c) {
     sy_sb_putn(b, &c, 1);
 }
 
-/* JSON string literal with control chars escaped — identities carry raw
- * 0x01 separators, which MUST round-trip as \u0001. */
+/* JSON string literal with control chars escaped (defensive: tags can
+ * carry stray control bytes; they must round-trip as \uXXXX). */
 static void sy_sb_json_str(sy_strbuf *b, const char *s) {
     sy_sb_putc(b, '"');
     if (s) {
@@ -235,8 +241,8 @@ static bool sy_json_get_bool(const char *json, const char *key, bool dflt) {
     return dflt;
 }
 
-/* Bounded string extraction with escape decoding (incl. \u0001 -> 0x01,
- * which every identity in a snapshot carries). */
+/* Bounded string extraction with escape decoding (incl. \uXXXX for control
+ * bytes that stray into tags; they must decode back losslessly). */
 static bool sy_json_get_str(const char *json, const char *key,
                             char *out, size_t out_n) {
     const char *v = sy_json_find_value(json, key);
@@ -363,6 +369,17 @@ void mn_sync_identity(const char *artist, const char *title,
     sy_norm(title,  nt,  sizeof(nt));
     sy_norm(album,  nal, sizeof(nal));
     bucket = (duration_ms > 0) ? (long long)(duration_ms / 10000) : 0;
+    /*
+     * !!! ANDROID-COMPATIBLE WIRE FORMAT — DO NOT CHANGE UNILATERALLY !!!
+     * The phone (SyncEngine.identity) builds the identity as the normalized
+     * fields CONCATENATED DIRECTLY, NO SEPARATORS:
+     *     "${norm(artist)}${norm(title)}${norm(album)}$durBucket"
+     * Any separator inserted here (an early build used 0x01 joiners) makes
+     * every identity mismatch the phone's and LAN sync silently matches
+     * NOTHING. Identities are rebuilt fresh on every sync run — nothing
+     * persisted keys off them — so the format lives only on the wire, and
+     * the wire format is owned by BOTH apps: change it in lockstep or never.
+     */
     snprintf(out, out_n, "%s\x01%s\x01%s\x01%lld", na, nt, nal, bucket);
 }
 
@@ -373,11 +390,14 @@ void mn_sync_identity(const char *artist, const char *title,
 typedef struct sy_local {
     int64_t id;
     char   *identity;        /* malloc'd */
+    char   *hash;            /* malloc'd content fingerprint (schema v7),
+                              * NULL when the backfill hasn't reached it   */
     int32_t liked;           /* thumbs: -1 dislike, 0 none, 1 like       */
     int32_t rating_x2;
     int64_t play_count;
     int64_t last_played_s;   /* stored unit: unix SECONDS                */
     int64_t pref_updated_ms;
+    int64_t votes_updated_ms;/* v8 vote-only LWW clock (0 = never voted) */
     /* snapshot-only originals (NULL when collected for a merge map) */
     char   *artist;
     char   *title;
@@ -396,7 +416,9 @@ static void sy_collect_cb(void *user, int64_t track_id,
                           const char *album, int64_t duration_ms,
                           int32_t liked, int32_t rating_x2,
                           int64_t play_count, int64_t last_played,
-                          int64_t pref_updated_ms) {
+                          int64_t pref_updated_ms,
+                          int64_t votes_updated_ms,
+                          const char *content_hash) {
     sy_collect *c = (sy_collect *)user;
     char idbuf[SY_ID_MAX];
     sy_local *t;
@@ -414,18 +436,26 @@ static void sy_collect_cb(void *user, int64_t track_id,
     memset(t, 0, sizeof(*t));
     t->id              = track_id;
     t->identity        = sy_strdup(idbuf);
-    t->liked           = liked;
-    t->rating_x2       = rating_x2;
-    t->play_count      = play_count;
-    t->last_played_s   = last_played;
-    t->pref_updated_ms = pref_updated_ms;
+    t->liked            = liked;
+    t->rating_x2        = rating_x2;
+    t->play_count       = play_count;
+    t->last_played_s    = last_played;
+    t->pref_updated_ms  = pref_updated_ms;
+    t->votes_updated_ms = votes_updated_ms;
     if (!t->identity) { c->oom = true; return; }
+    /* hash stays NULL when the row has none — "no fingerprint" must stay
+     * distinguishable from an empty string all the way to the JSON */
+    if (content_hash && content_hash[0]) {
+        t->hash = sy_strdup(content_hash);
+        if (!t->hash) { free(t->identity); c->oom = true; return; }
+    }
     if (c->want_tags) {
         t->artist = sy_strdup(artist);
         t->title  = sy_strdup(title);
         t->album  = sy_strdup(album);
         if (!t->artist || !t->title || !t->album) {
-            free(t->artist); free(t->title); free(t->album); free(t->identity);
+            free(t->artist); free(t->title); free(t->album);
+            free(t->identity); free(t->hash);
             c->oom = true;
             return;
         }
@@ -437,6 +467,7 @@ static void sy_collect_free(sy_collect *c) {
     size_t i;
     for (i = 0; i < c->n; i++) {
         free(c->v[i].identity);
+        free(c->v[i].hash);
         free(c->v[i].artist);
         free(c->v[i].title);
         free(c->v[i].album);
@@ -446,25 +477,39 @@ static void sy_collect_free(sy_collect *c) {
     c->n = c->cap = 0;
 }
 
-/* Open-addressing identity map over a collected array (indices + 1 so 0
- * means empty; first collector wins on duplicate identities — duplicate
- * tag+duration files legitimately share one record per §7). */
+/* Open-addressing key map over a collected array (indices + 1 so 0 means
+ * empty). One implementation serves BOTH merge lookups: keyed on the tag
+ * identity (by_hash false) or on the content fingerprint (by_hash true —
+ * rows without one are simply not inserted). First collector wins on
+ * duplicate keys — duplicate tag+duration files legitimately share one
+ * record per §7, and byte-identical file copies share one fingerprint. */
 typedef struct sy_map {
     uint64_t *hash;
     size_t   *slot;   /* index into sy_collect.v, +1 (0 = empty)         */
     size_t    cap;    /* power of two                                    */
+    bool      by_hash;/* key field: content fingerprint vs tag identity  */
 } sy_map;
 
-static bool sy_map_build(sy_map *m, const sy_collect *c) {
+/* The row's key under this map's keying (NULL = row has no such key). */
+static const char *sy_map_key(const sy_map *m, const sy_collect *c, size_t i) {
+    return m->by_hash ? c->v[i].hash : c->v[i].identity;
+}
+
+static bool sy_map_build(sy_map *m, const sy_collect *c, bool by_hash) {
     size_t cap = 64, i;
     while (cap < c->n * 2 + 1) cap *= 2;
-    m->hash = (uint64_t *)calloc(cap, sizeof(uint64_t));
-    m->slot = (size_t *)calloc(cap, sizeof(size_t));
-    m->cap  = cap;
+    m->hash    = (uint64_t *)calloc(cap, sizeof(uint64_t));
+    m->slot    = (size_t *)calloc(cap, sizeof(size_t));
+    m->cap     = cap;
+    m->by_hash = by_hash;
     if (!m->hash || !m->slot) return false;
     for (i = 0; i < c->n; i++) {
-        uint64_t h = sy_hash(c->v[i].identity);
-        size_t   b = (size_t)h & (cap - 1);
+        const char *key = sy_map_key(m, c, i);
+        uint64_t    h;
+        size_t      b;
+        if (!key) continue;   /* no fingerprint yet: identity-only row */
+        h = sy_hash(key);
+        b = (size_t)h & (cap - 1);
         for (;;) {
             if (m->slot[b] == 0) {
                 m->hash[b] = h;
@@ -472,8 +517,8 @@ static bool sy_map_build(sy_map *m, const sy_collect *c) {
                 break;
             }
             if (m->hash[b] == h &&
-                strcmp(c->v[m->slot[b] - 1].identity, c->v[i].identity) == 0) {
-                break;   /* duplicate identity: keep the first row */
+                strcmp(sy_map_key(m, c, m->slot[b] - 1), key) == 0) {
+                break;   /* duplicate key: keep the first row */
             }
             b = (b + 1) & (cap - 1);
         }
@@ -481,13 +526,13 @@ static bool sy_map_build(sy_map *m, const sy_collect *c) {
     return true;
 }
 
-static sy_local *sy_map_find(const sy_map *m, sy_collect *c, const char *identity) {
-    uint64_t h = sy_hash(identity);
+static sy_local *sy_map_find(const sy_map *m, sy_collect *c, const char *key) {
+    uint64_t h = sy_hash(key);
     size_t   b = (size_t)h & (m->cap - 1);
     for (;;) {
         if (m->slot[b] == 0) return NULL;
         if (m->hash[b] == h &&
-            strcmp(c->v[m->slot[b] - 1].identity, identity) == 0) {
+            strcmp(sy_map_key(m, c, m->slot[b] - 1), key) == 0) {
             return &c->v[m->slot[b] - 1];
         }
         b = (b + 1) & (m->cap - 1);
@@ -500,6 +545,77 @@ static void sy_map_free(sy_map *m) {
     m->hash = NULL;
     m->slot = NULL;
     m->cap = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Book-progress collection (the snapshot's "books" section feed)      */
+/* ------------------------------------------------------------------ */
+
+typedef struct sy_book {
+    int64_t album_id;
+    int64_t track_id;
+    char   *identity;        /* malloc'd chapter tag identity            */
+    char   *hash;            /* malloc'd content fingerprint or NULL     */
+    int64_t pos_ms;
+    double  percent;
+    bool    finished;
+    bool    current;
+    int64_t updated_s;       /* stored unit: unix SECONDS                */
+} sy_book;
+
+typedef struct sy_book_collect {
+    sy_book *v;
+    size_t   n, cap;
+    bool     oom;
+} sy_book_collect;
+
+static void sy_book_collect_cb(void *user, int64_t album_id, int64_t track_id,
+                               const char *artist, const char *title,
+                               const char *album, int64_t duration_ms,
+                               const char *content_hash,
+                               int64_t pos_ms, double percent,
+                               bool finished, bool current,
+                               int64_t updated) {
+    sy_book_collect *c = (sy_book_collect *)user;
+    char idbuf[SY_ID_MAX];
+    sy_book *bk;
+
+    if (c->oom) return;
+    if (c->n == c->cap) {
+        size_t   ncap = c->cap ? c->cap * 2 : 64;
+        sy_book *nv = (sy_book *)realloc(c->v, ncap * sizeof(*nv));
+        if (!nv) { c->oom = true; return; }
+        c->v = nv;
+        c->cap = ncap;
+    }
+    mn_sync_identity(artist, title, album, duration_ms, idbuf, sizeof(idbuf));
+    bk = &c->v[c->n];
+    memset(bk, 0, sizeof(*bk));
+    bk->album_id  = album_id;
+    bk->track_id  = track_id;
+    bk->identity  = sy_strdup(idbuf);
+    bk->pos_ms    = pos_ms;
+    bk->percent   = percent;
+    bk->finished  = finished;
+    bk->current   = current;
+    bk->updated_s = updated;
+    if (!bk->identity) { c->oom = true; return; }
+    if (content_hash && content_hash[0]) {
+        bk->hash = sy_strdup(content_hash);
+        if (!bk->hash) { free(bk->identity); c->oom = true; return; }
+    }
+    c->n++;
+}
+
+static void sy_book_collect_free(sy_book_collect *c) {
+    size_t i;
+    for (i = 0; i < c->n; i++) {
+        free(c->v[i].identity);
+        free(c->v[i].hash);
+    }
+    free(c->v);
+    c->v = NULL;
+    c->n = c->cap = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -527,6 +643,18 @@ char *mn_sync_build_snapshot(const mn_sync_env *env) {
     sy_sb_init(&b);
     sy_sb_puts(&b, "{\"protocol\":1,\"device\":\"desktop\",\"exportedAt\":");
     sy_sb_json_i64(&b, sy_now_ms());
+    /* Additive v1 extension: remote-control pairing info (see sync.h). */
+    if (env->control_token && env->control_token[0]) {
+        sy_sb_puts(&b, ",\"control\":{\"port\":");
+        sy_sb_json_i64(&b, env->control_port > 0 ? env->control_port : 8797);
+        sy_sb_puts(&b, ",\"token\":");
+        sy_sb_json_str(&b, env->control_token);
+        if (env->control_name && env->control_name[0]) {
+            sy_sb_puts(&b, ",\"name\":");
+            sy_sb_json_str(&b, env->control_name);
+        }
+        sy_sb_putc(&b, '}');
+    }
     sy_sb_puts(&b, ",\"items\":[");
     {
         size_t emitted = 0;
@@ -534,16 +662,27 @@ char *mn_sync_build_snapshot(const mn_sync_env *env) {
             const sy_local *t = &c.v[i];
             /* Field toggles: disabled groups emit as defaults, and a record
              * with NOTHING enabled left is skipped entirely (§2 says emit
-             * only non-default records). */
+             * only non-default records). A cleared vote (liked back to 0,
+             * votes_updated_ms > 0) still emits — the un-like IS the news. */
             int32_t s_liked = env->fields.likes   ? t->liked          : 0;
-            int32_t s_stars = env->fields.ratings ? t->rating_x2 / 2  : 0;
+            int64_t s_votes = env->fields.likes   ? t->votes_updated_ms : 0;
             int64_t s_plays = env->fields.plays   ? t->play_count     : 0;
             int64_t s_last  = env->fields.plays && t->last_played_s > 0
                             ? t->last_played_s * 1000 : 0;
-            if (!s_liked && !s_stars && !s_plays && !s_last) continue;
+            if (!s_liked && !s_plays && !s_last && !s_votes) continue;
             if (emitted++) sy_sb_putc(&b, ',');
             sy_sb_puts(&b, "{\"id\":");
             sy_sb_json_str(&b, t->identity);
+            /* additive v1 extension: the content fingerprint, so the peer
+             * matches move/retag-proof. RE-ENABLED (was `if (0 && ...)`,
+             * see MODULES.md 2026-08-24): the phone-side import now
+             * resolves hashes from its PERSISTED memo without hashing on
+             * miss, so an unknown hash costs a map lookup instead of the
+             * full-library SAF walk that blew the first-sync timeouts. */
+            if (t->hash) {
+                sy_sb_puts(&b, ",\"hash\":");
+                sy_sb_json_str(&b, t->hash);
+            }
             sy_sb_puts(&b, ",\"artist\":");
             sy_sb_json_str(&b, t->artist);
             sy_sb_puts(&b, ",\"title\":");
@@ -554,19 +693,67 @@ char *mn_sync_build_snapshot(const mn_sync_env *env) {
             sy_sb_json_bool(&b, s_liked == 1);
             sy_sb_puts(&b, ",\"disliked\":");
             sy_sb_json_bool(&b, s_liked == -1);
-            sy_sb_puts(&b, ",\"stars\":");
-            sy_sb_json_i64(&b, s_stars);
+            /* NO "stars" key: the desktop retired its star-rating UI and
+             * stopped exporting ratings (stored rating_x2 data is kept,
+             * display/export removal only). The phone's merge has()-guards
+             * the field, so its absence never clears a peer rating. */
             sy_sb_puts(&b, ",\"playCount\":");
             sy_sb_json_i64(&b, s_plays);
             sy_sb_puts(&b, ",\"lastPlayedAt\":");
             sy_sb_json_i64(&b, s_last);
             sy_sb_puts(&b, ",\"updatedAt\":");
             sy_sb_json_i64(&b, t->pref_updated_ms);
+            /* Moves ONLY on a local vote change (v8) — what lets the peer
+             * tell a real un-like from a record whose plays advanced. */
+            sy_sb_puts(&b, ",\"votesUpdatedAt\":");
+            sy_sb_json_i64(&b, t->votes_updated_ms);
             sy_sb_putc(&b, '}');
         }
     }
-    sy_sb_puts(&b, "]}");
+    sy_sb_puts(&b, "]");
     sy_collect_free(&c);
+
+    /* Additive v1 "books" section: one record per book_progress row
+     * (chapter with a remembered position). Same missing-field discipline
+     * as the votes block — the peer must treat absent keys as "no change".
+     * `upd` is converted to protocol MILLISECONDS here (stored unit is
+     * unix seconds); `pct` is advisory (the peer recomputes what it can). */
+    {
+        sy_book_collect bc;
+        memset(&bc, 0, sizeof(bc));
+        sy_env_lock(env);
+        (void)mn_library_book_sync_enumerate(env->lib, sy_book_collect_cb, &bc);
+        sy_env_unlock(env);
+        if (!bc.oom && bc.n > 0) {
+            sy_sb_puts(&b, ",\"books\":[");
+            for (i = 0; i < bc.n; i++) {
+                const sy_book *bk = &bc.v[i];
+                char num[32];
+                if (i) sy_sb_putc(&b, ',');
+                sy_sb_puts(&b, "{\"id\":");
+                sy_sb_json_str(&b, bk->identity);
+                if (bk->hash) {
+                    sy_sb_puts(&b, ",\"hash\":");
+                    sy_sb_json_str(&b, bk->hash);
+                }
+                sy_sb_puts(&b, ",\"pos\":");
+                sy_sb_json_i64(&b, bk->pos_ms);
+                snprintf(num, sizeof(num), "%.4f", bk->percent);
+                sy_sb_puts(&b, ",\"pct\":");
+                sy_sb_puts(&b, num);
+                sy_sb_puts(&b, ",\"fin\":");
+                sy_sb_json_bool(&b, bk->finished);
+                sy_sb_puts(&b, ",\"cur\":");
+                sy_sb_json_bool(&b, bk->current);
+                sy_sb_puts(&b, ",\"upd\":");
+                sy_sb_json_i64(&b, bk->updated_s * 1000);
+                sy_sb_putc(&b, '}');
+            }
+            sy_sb_putc(&b, ']');
+        }
+        sy_book_collect_free(&bc);
+    }
+    sy_sb_puts(&b, "}");
 
     if (b.oom) {
         sy_sb_free(&b);
@@ -582,12 +769,19 @@ char *mn_sync_build_snapshot(const mn_sync_env *env) {
 /* One parsed remote record. */
 typedef struct sy_remote {
     char   *id;              /* malloc'd identity                       */
+    char   *hash;            /* malloc'd content fingerprint, NULL when
+                              * the record carried none                 */
     bool    liked;
     bool    disliked;
+    bool    has_stars;       /* record carried a "stars" key at all —
+                              * absent must NEVER zero a local rating   */
     int     stars;
     int64_t play_count;
     int64_t last_played_ms;
     int64_t updated_ms;
+    int64_t votes_updated_ms;/* vote-only LWW clock; 0 when the peer
+                              * sent none (then it can add votes but
+                              * never clear them)                       */
 } sy_remote;
 
 /*
@@ -648,28 +842,40 @@ static bool sy_parse_items(const char *json, sy_remote **out_v, size_t *out_n) {
         if (!item) break;
         memset(&r, 0, sizeof(r));
         if (sy_json_get_str(item, "id", idbuf, sizeof(idbuf)) && idbuf[0]) {
+            /* optional content fingerprint ("%016llx", 16 hex chars) —
+             * absence and OOM both degrade to the identity fallback */
+            char hashbuf[64];
+            if (sy_json_get_str(item, "hash", hashbuf, sizeof(hashbuf)) &&
+                hashbuf[0]) {
+                r.hash = sy_strdup(hashbuf);
+            }
             r.liked          = sy_json_get_bool(item, "liked", false);
             r.disliked       = sy_json_get_bool(item, "disliked", false);
             if (r.liked) r.disliked = false;   /* both set: liked wins (§7) */
+            r.has_stars      = sy_json_find_value(item, "stars") != NULL;
             r.stars          = (int)sy_json_get_i64(item, "stars", 0);
             r.play_count     = sy_json_get_i64(item, "playCount", 0);
             r.last_played_ms = sy_json_get_i64(item, "lastPlayedAt", 0);
             r.updated_ms     = sy_json_get_i64(item, "updatedAt", 0);
+            r.votes_updated_ms = sy_json_get_i64(item, "votesUpdatedAt", 0);
             if (r.stars < 0) r.stars = 0;
             if (r.stars > 5) r.stars = 5;
             if (r.play_count < 0) r.play_count = 0;
             if (r.last_played_ms < 0) r.last_played_ms = 0;
             if (r.updated_ms < 0) r.updated_ms = 0;
+            if (r.votes_updated_ms < 0) r.votes_updated_ms = 0;
             r.id = sy_strdup(idbuf);
             if (r.id) {
                 if (n == cap) {
                     size_t     ncap = cap ? cap * 2 : 256;
                     sy_remote *nv = (sy_remote *)realloc(v, ncap * sizeof(*nv));
-                    if (!nv) { free(r.id); free(item); break; }
+                    if (!nv) { free(r.id); free(r.hash); free(item); break; }
                     v = nv;
                     cap = ncap;
                 }
                 v[n++] = r;
+            } else {
+                free(r.hash);
             }
         }
         free(item);
@@ -680,17 +886,20 @@ static bool sy_parse_items(const char *json, sy_remote **out_v, size_t *out_n) {
 }
 
 bool mn_sync_merge_snapshot(const mn_sync_env *env, const char *json,
-                            int *out_applied, int *out_skipped) {
+                            int *out_applied, int *out_skipped,
+                            int *out_by_hash, int *out_by_id) {
     sy_remote *rv = NULL;
     size_t     rn = 0, i;
     sy_collect c;
-    sy_map     map;
-    int        applied = 0, skipped = 0;
+    sy_map     map, hmap;
+    int        applied = 0, skipped = 0, by_hash = 0, by_id = 0;
     bool       ok = false, own_txn = false;
     int64_t    proto;
 
     if (out_applied) *out_applied = 0;
     if (out_skipped) *out_skipped = 0;
+    if (out_by_hash) *out_by_hash = 0;
+    if (out_by_id)   *out_by_id   = 0;
     if (!env || !env->lib || !json) return false;
 
     /* §6: refuse snapshots from a newer protocol. */
@@ -701,11 +910,15 @@ bool mn_sync_merge_snapshot(const mn_sync_env *env, const char *json,
 
     memset(&c, 0, sizeof(c));
     memset(&map, 0, sizeof(map));
+    memset(&hmap, 0, sizeof(hmap));
     c.want_tags = false;
 
+    /* Two lookup maps over ONE enumerate: content fingerprints (exact,
+     * move/retag-proof — tried first) and tag identities (the fallback). */
     sy_env_lock(env);
     if (mn_library_sync_enumerate(env->lib, true, sy_collect_cb, &c) != MN_OK
-        || c.oom || !sy_map_build(&map, &c)) {
+        || c.oom || !sy_map_build(&map, &c, false)
+        || !sy_map_build(&hmap, &c, true)) {
         sy_env_unlock(env);
         goto done;
     }
@@ -717,10 +930,21 @@ bool mn_sync_merge_snapshot(const mn_sync_env *env, const char *json,
 
     for (i = 0; i < rn; i++) {
         const sy_remote *r = &rv[i];
-        sy_local *loc = sy_map_find(&map, &c, r->id);
-        int64_t   new_play, new_last_ms, fin_upd;
+        sy_local *loc = NULL;
+        int64_t   new_play, new_last_ms, fin_upd, fin_votes_ms;
         int       fin_liked, fin_disliked, fin_stars, fin_thumbs;
+        int32_t   rem_thumb;
 
+        /* Fingerprint first (survives retags that break the identity),
+         * tag identity as the fallback (rows the backfill hasn't hashed,
+         * peers that sent no hash). */
+        if (r->hash) loc = sy_map_find(&hmap, &c, r->hash);
+        if (loc) {
+            by_hash++;
+        } else {
+            loc = sy_map_find(&map, &c, r->id);
+            if (loc) by_id++;
+        }
         if (!loc) { skipped++; continue; }
 
         /* Play stats are monotonic: take the MAX (never lose plays) —
@@ -736,27 +960,48 @@ bool mn_sync_merge_snapshot(const mn_sync_env *env, const char *json,
             new_last_ms = loc->last_played_s * 1000;
         }
 
-        /* Preference fields move as a GROUP: newest updatedAt wins — but
-         * each sub-group only applies when its toggle is on (a disabled
-         * group keeps the LOCAL value even when remote is newer). */
-        if (r->updated_ms > loc->pref_updated_ms
-            && (env->fields.likes || env->fields.ratings)) {
-            if (env->fields.likes) {
-                fin_liked    = r->liked ? 1 : 0;
-                fin_disliked = (!r->liked && r->disliked) ? 1 : 0;
-            } else {
-                fin_liked    = (loc->liked == 1)  ? 1 : 0;
-                fin_disliked = (loc->liked == -1) ? 1 : 0;
-            }
-            fin_stars = env->fields.ratings ? r->stars : loc->rating_x2 / 2;
+        /* RATINGS still move on the shared updatedAt group — but only when
+         * the record actually CARRIED a stars key (the desktop peer of this
+         * code no longer exports one; its absence must not zero anything)
+         * and the toggle is on. */
+        if (r->updated_ms > loc->pref_updated_ms) {
+            fin_stars = (env->fields.ratings && r->has_stars)
+                      ? r->stars : loc->rating_x2 / 2;
             fin_upd   = r->updated_ms;
         } else {
-            fin_liked    = (loc->liked == 1)  ? 1 : 0;
-            fin_disliked = (loc->liked == -1) ? 1 : 0;
-            fin_stars    = loc->rating_x2 / 2;
-            fin_upd      = loc->pref_updated_ms;
+            fin_stars = loc->rating_x2 / 2;
+            fin_upd   = loc->pref_updated_ms;
         }
-        fin_thumbs = fin_liked ? 1 : (fin_disliked ? -1 : 0);
+
+        /* VOTES have their own clock (v8) — split OUT of the updatedAt
+         * group, mirroring the Android merge exactly: a record whose
+         * updatedAt advanced because of a play count is NOT authoritative
+         * about votes. TRUE is additive from neutral; a FLIP of an
+         * existing vote and a CLEAR both need votesUpdatedAt strictly
+         * newer than ours (ties keep local — no ping-pong). */
+        rem_thumb    = r->liked ? 1 : (r->disliked ? -1 : 0);
+        fin_thumbs   = loc->liked;
+        fin_votes_ms = loc->votes_updated_ms;
+        if (env->fields.likes) {
+            if (rem_thumb != 0) {
+                if (loc->liked == 0 ||
+                    (rem_thumb != loc->liked &&
+                     r->votes_updated_ms > loc->votes_updated_ms)) {
+                    fin_thumbs = rem_thumb;
+                }
+            } else if (loc->liked != 0 &&
+                       r->votes_updated_ms > loc->votes_updated_ms) {
+                fin_thumbs = 0;   /* genuine, provably newer remote un-vote */
+            }
+            if (fin_thumbs != loc->liked) {
+                /* Adopt the peer's vote clock; a legacy peer sending none
+                 * gets a local stamp so the vote never sits at 0. */
+                fin_votes_ms = r->votes_updated_ms > 0 ? r->votes_updated_ms
+                                                       : sy_now_ms();
+            }
+        }
+        fin_liked    = (fin_thumbs == 1)  ? 1 : 0;
+        fin_disliked = (fin_thumbs == -1) ? 1 : 0;
 
         /* Only write rows that actually change (idempotent re-merges are
          * no-ops; last_played compares in the stored unit, seconds). */
@@ -764,20 +1009,82 @@ bool mn_sync_merge_snapshot(const mn_sync_env *env, const char *json,
             fin_stars * 2   == loc->rating_x2 &&
             new_play        == loc->play_count &&
             new_last_ms / 1000 == loc->last_played_s &&
-            fin_upd         == loc->pref_updated_ms) {
+            fin_upd         == loc->pref_updated_ms &&
+            fin_votes_ms    == loc->votes_updated_ms) {
             continue;
         }
         if (mn_library_sync_apply(env->lib, loc->id, fin_liked, fin_disliked,
                                   fin_stars, new_play, new_last_ms,
-                                  fin_upd) == MN_OK) {
+                                  fin_upd, fin_votes_ms) == MN_OK) {
             applied++;
+            /* Per-category tallies — what this row's change actually WAS,
+             * for the plain-words sync summary (a row can hit several). */
+            if (env->counts_out) {
+                mn_sync_counts *ct = env->counts_out;
+                if (fin_thumbs != loc->liked) {
+                    if      (fin_thumbs == 1)  ct->likes++;
+                    else if (fin_thumbs == -1) ct->dislikes++;
+                    else                       ct->cleared++;
+                }
+                if (fin_stars * 2 != loc->rating_x2)         ct->ratings++;
+                if (new_play != loc->play_count ||
+                    new_last_ms / 1000 != loc->last_played_s) ct->plays++;
+            }
             /* Keep the in-memory row current so duplicate remote ids merge
              * against the merged values, not the stale ones. */
-            loc->liked           = (int32_t)fin_thumbs;
-            loc->rating_x2       = (int32_t)(fin_stars * 2);
-            loc->play_count      = new_play;
-            loc->last_played_s   = new_last_ms / 1000;
-            loc->pref_updated_ms = fin_upd;
+            loc->liked            = (int32_t)fin_thumbs;
+            loc->rating_x2        = (int32_t)(fin_stars * 2);
+            loc->play_count       = new_play;
+            loc->last_played_s    = new_last_ms / 1000;
+            loc->pref_updated_ms  = fin_upd;
+            loc->votes_updated_ms = fin_votes_ms;
+        }
+    }
+
+    /* --- "books" section (additive v1): audiobook chapter positions. ---
+     * Same match ladder as items (hash first, tag identity fallback), then
+     * LWW inside mn_library_book_sync_apply (which also recomputes percent
+     * locally and preserves the current-chapter singleton). `upd` arrives
+     * in protocol ms and is stored in unix seconds. */
+    {
+        const char *bp = sy_json_find_value(json, "books");
+        if (bp && *bp == '[') {
+            bp++;
+            for (;;) {
+                char *item = sy_next_item(&bp);
+                char  idbuf[SY_ID_MAX];
+                char  hashbuf[64];
+                sy_local *loc = NULL;
+                if (!item) break;
+                hashbuf[0] = 0;
+                (void)sy_json_get_str(item, "hash", hashbuf, sizeof(hashbuf));
+                idbuf[0] = 0;
+                (void)sy_json_get_str(item, "id", idbuf, sizeof(idbuf));
+                if (hashbuf[0]) loc = sy_map_find(&hmap, &c, hashbuf);
+                if (!loc && idbuf[0]) loc = sy_map_find(&map, &c, idbuf);
+                if (loc) {
+                    int64_t album_id =
+                        mn_library_track_album_id(env->lib, loc->id);
+                    if (album_id > 0) {
+                        bool changed = false;
+                        bool has_fin =
+                            sy_json_find_value(item, "fin") != NULL;
+                        int64_t upd_ms = sy_json_get_i64(item, "upd", 0);
+                        (void)mn_library_book_sync_apply(
+                            env->lib, album_id, loc->id,
+                            sy_json_get_i64(item, "pos", 0),
+                            has_fin,
+                            sy_json_get_bool(item, "fin", false),
+                            sy_json_get_bool(item, "cur", false),
+                            upd_ms / 1000, &changed);
+                        if (changed) {
+                            applied++;
+                            if (env->counts_out) env->counts_out->books++;
+                        }
+                    }
+                }
+                free(item);
+            }
         }
     }
 
@@ -789,11 +1096,14 @@ bool mn_sync_merge_snapshot(const mn_sync_env *env, const char *json,
 
 done:
     sy_map_free(&map);
+    sy_map_free(&hmap);
     sy_collect_free(&c);
-    for (i = 0; i < rn; i++) free(rv[i].id);
+    for (i = 0; i < rn; i++) { free(rv[i].id); free(rv[i].hash); }
     free(rv);
     if (out_applied) *out_applied = applied;
     if (out_skipped) *out_skipped = skipped;
+    if (out_by_hash) *out_by_hash = by_hash;
+    if (out_by_id)   *out_by_id   = by_id;
     return ok;
 }
 
@@ -810,7 +1120,7 @@ done:
  * NUL-terminated body (caller frees) or NULL on any failure / non-200.
  */
 static char *sy_http_req(const char *host, int port, const char *path,
-                         const char *body) {
+                         const char *body, int recv_ms) {
     wchar_t   whost[256], wpath[512];
     HINTERNET s = NULL, c = NULL, r = NULL;
     char     *buf = NULL;
@@ -824,8 +1134,13 @@ static char *sy_http_req(const char *host, int port, const char *path,
     s = WinHttpOpen(L"Monatomic/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!s) goto done;
-    /* resolve/connect ~5 s, send/receive ~10 s */
-    WinHttpSetTimeouts(s, 5000, 5000, 10000, 10000);
+    /* resolve/connect ~5 s; send ~10 s; receive per caller — a FIRST sync
+     * on a big library legitimately keeps the phone busy for tens of
+     * seconds (parse + merge thousands of records, then export its own
+     * snapshot into the response), so /sync/snapshot and /sync/merge pass
+     * a much wider window than /sync/ping. */
+    if (recv_ms < 10000) recv_ms = 10000;
+    WinHttpSetTimeouts(s, 5000, 5000, 10000, recv_ms);
     c = WinHttpConnect(s, whost, (INTERNET_PORT)port, 0);
     if (!c) goto done;
     /* No WINHTTP_FLAG_SECURE: the phone's server is plain HTTP (§4a). */
@@ -882,7 +1197,295 @@ done:
     return buf;
 }
 
+/* ------------------------------------------------------------------ */
+/* Raw-bytes transport (wireless file transfer + have-query)           */
+/* ------------------------------------------------------------------ */
+
+/* Upload size cap: fail soft above this instead of hogging the LAN for
+ * hours (the phone endpoint targets ~200 MB tracks; 1 GiB is headroom). */
+#define SY_XFER_CAP (1024LL * 1024 * 1024)
+
+/* Streamed upload chunk (fread -> WinHttpWriteData). */
+#define SY_XFER_CHUNK (256 * 1024)
+
+/* Percent-encode `s` (UTF-8 bytes) into `out` for a query-string value.
+ * Unreserved chars pass through; everything else becomes %XX. Truncates
+ * safely (always NUL-terminated). */
+static void sy_url_encode(const char *s, char *out, size_t out_n) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t o = 0;
+    if (!out || out_n == 0) return;
+    for (; s && *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+            c == '.' || c == '~') {
+            if (o + 1 >= out_n) break;
+            out[o++] = (char)c;
+        } else {
+            if (o + 3 >= out_n) break;
+            out[o++] = '%';
+            out[o++] = hex[c >> 4];
+            out[o++] = hex[c & 0xF];
+        }
+    }
+    out[o] = 0;
+}
+
+/*
+ * GET with a HEAP-converted path — sy_http_req's stack wpath[512] is fine
+ * for the fixed sync endpoints but the have-query URL carries up to ~1500
+ * hashes (~25 KB). Same timeouts, cap and return contract as sy_http_req.
+ * (A separate helper rather than a bigger stack buffer: the JSON one stays
+ * untouched, per the "add a variant" rule.)
+ */
+static char *sy_http_get_dyn(const char *host, int port, const char *path) {
+    wchar_t   whost[256];
+    wchar_t  *wpath = NULL;
+    int       wlen;
+    HINTERNET s = NULL, c = NULL, r = NULL;
+    char     *buf = NULL;
+    size_t    len = 0, cap = 0;
+    bool      ok = false;
+
+    if (!host || !host[0] || !path) return NULL;
+    if (MultiByteToWideChar(CP_UTF8, 0, host, -1, whost, 256) <= 0) return NULL;
+    wlen = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+    if (wlen <= 0) return NULL;
+    wpath = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
+    if (!wpath) return NULL;
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, wlen) <= 0) {
+        free(wpath);
+        return NULL;
+    }
+
+    s = WinHttpOpen(L"Monatomic/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!s) goto done;
+    WinHttpSetTimeouts(s, 5000, 5000, 10000, 10000);
+    c = WinHttpConnect(s, whost, (INTERNET_PORT)port, 0);
+    if (!c) goto done;
+    r = WinHttpOpenRequest(c, L"GET", wpath, NULL, WINHTTP_NO_REFERER,
+                           WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+    if (!r) goto done;
+    if (!WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(r, NULL)) goto done;
+    {
+        DWORD status = 0, sl = sizeof(status);
+        WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE |
+                               WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &sl,
+                            WINHTTP_NO_HEADER_INDEX);
+        if (status != 200) goto done;
+    }
+    for (;;) {
+        DWORD avail = 0, got = 0;
+        if (!WinHttpQueryDataAvailable(r, &avail)) goto done;
+        if (avail == 0) break;
+        if (len + avail + 1 > SY_HTTP_CAP) goto done;
+        if (len + avail + 1 > cap) {
+            size_t ncap = cap ? cap : 16384;
+            char  *nb;
+            while (len + avail + 1 > ncap) ncap *= 2;
+            nb = (char *)realloc(buf, ncap);
+            if (!nb) goto done;
+            buf = nb;
+            cap = ncap;
+        }
+        if (!WinHttpReadData(r, buf + len, avail, &got)) goto done;
+        if (got == 0) break;
+        len += got;
+    }
+    if (!buf) {
+        buf = (char *)malloc(1);
+        if (!buf) goto done;
+    }
+    buf[len] = '\0';
+    ok = true;
+done:
+    if (r) WinHttpCloseHandle(r);
+    if (c) WinHttpCloseHandle(c);
+    if (s) WinHttpCloseHandle(s);
+    free(wpath);
+    if (!ok) { free(buf); buf = NULL; }
+    return buf;
+}
+
 #endif /* _WIN32 */
+
+static void sy_err(char *err, size_t err_n, const char *msg) {
+    if (err && err_n) snprintf(err, err_n, "%s", msg);
+}
+
+bool mn_sync_send_file(const char *host, int port, const char *file_path,
+                       const char *name, const char *hash,
+                       mn_sync_xfer_cb cb, void *user,
+                       bool *out_skipped, char *err, size_t err_n) {
+    if (out_skipped) *out_skipped = false;
+    sy_err(err, err_n, "");
+#ifndef _WIN32
+    (void)host; (void)port; (void)file_path; (void)name; (void)hash;
+    (void)cb; (void)user;
+    sy_err(err, err_n, "file transfer is Windows-only for now");
+    return false;
+#else
+    {
+        char      enc[1024], path[1400];
+        wchar_t   whost[256], wpath[1400];
+        HINTERNET s = NULL, c = NULL, r = NULL;
+        FILE     *f = NULL;
+        char     *chunk = NULL, *body = NULL;
+        long long size;
+        int64_t   sent = 0;
+        size_t    blen = 0, bcap = 0;
+        bool      ok = false;
+
+        if (!host || !host[0] || !file_path || !name || !hash || !hash[0]) {
+            sy_err(err, err_n, "no phone configured");
+            return false;
+        }
+        if (port <= 0 || port > 65535) port = MN_SYNC_DEFAULT_PORT;
+
+        f = fopen(file_path, "rb");
+        if (!f) {
+            sy_err(err, err_n, "cannot open the file");
+            return false;
+        }
+        if (_fseeki64(f, 0, SEEK_END) != 0 || (size = _ftelli64(f)) <= 0 ||
+            _fseeki64(f, 0, SEEK_SET) != 0) {
+            fclose(f);
+            sy_err(err, err_n, "cannot read the file");
+            return false;
+        }
+        if (size > SY_XFER_CAP) {
+            fclose(f);
+            sy_err(err, err_n, "file too large to send (over 1 GB)");
+            return false;
+        }
+
+        sy_url_encode(name, enc, sizeof(enc));
+        snprintf(path, sizeof(path), "/sync/file?name=%s&hash=%s", enc, hash);
+        if (MultiByteToWideChar(CP_UTF8, 0, host, -1, whost, 256) <= 0 ||
+            MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 1400) <= 0) {
+            fclose(f);
+            sy_err(err, err_n, "bad host or filename");
+            return false;
+        }
+        chunk = (char *)malloc(SY_XFER_CHUNK);
+        if (!chunk) {
+            fclose(f);
+            sy_err(err, err_n, "out of memory");
+            return false;
+        }
+
+        sy_err(err, err_n, "phone unreachable (is the sync server on?)");
+        s = WinHttpOpen(L"Monatomic/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!s) goto done;
+        /* connect ~5 s; per-write and final-response windows are generous —
+         * a big file over slow Wi-Fi must not trip the JSON timeouts. */
+        WinHttpSetTimeouts(s, 5000, 5000, 30000, 60000);
+        c = WinHttpConnect(s, whost, (INTERNET_PORT)port, 0);
+        if (!c) goto done;
+        r = WinHttpOpenRequest(c, L"POST", wpath, NULL, WINHTTP_NO_REFERER,
+                               WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+        if (!r) goto done;
+        /* Content-Length comes from dwTotalLength; the body follows via
+         * WinHttpWriteData so the file streams instead of living in RAM. */
+        if (!WinHttpSendRequest(r,
+                                L"Content-Type: application/octet-stream\r\n",
+                                (DWORD)-1, WINHTTP_NO_REQUEST_DATA, 0,
+                                (DWORD)size, 0)) goto done;
+        sy_err(err, err_n, "connection lost while sending");
+        while (sent < size) {
+            size_t want = (size_t)((size - sent) < SY_XFER_CHUNK
+                                   ? (size - sent) : SY_XFER_CHUNK);
+            size_t got = fread(chunk, 1, want, f);
+            DWORD  wrote = 0;
+            if (got != want) {
+                sy_err(err, err_n, "file changed while sending");
+                goto done;
+            }
+            if (!WinHttpWriteData(r, chunk, (DWORD)got, &wrote) ||
+                wrote != (DWORD)got) goto done;
+            sent += (int64_t)got;
+            if (cb) cb(user, sent, (int64_t)size);
+        }
+        if (!WinHttpReceiveResponse(r, NULL)) {
+            sy_err(err, err_n, "phone did not answer after the upload");
+            goto done;
+        }
+        {
+            DWORD status = 0, sl = sizeof(status);
+            WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE |
+                                   WINHTTP_QUERY_FLAG_NUMBER,
+                                WINHTTP_HEADER_NAME_BY_INDEX, &status, &sl,
+                                WINHTTP_NO_HEADER_INDEX);
+            if (status != 200) {
+                sy_err(err, err_n, "phone refused the file");
+                goto done;
+            }
+        }
+        /* small JSON reply: {"ok":true,"path":"...","skipped":bool} */
+        for (;;) {
+            DWORD avail = 0, got = 0;
+            if (!WinHttpQueryDataAvailable(r, &avail)) break;
+            if (avail == 0) break;
+            if (blen + avail + 1 > (size_t)SY_HTTP_CAP) break;
+            if (blen + avail + 1 > bcap) {
+                size_t ncap = bcap ? bcap : 1024;
+                char  *nb;
+                while (blen + avail + 1 > ncap) ncap *= 2;
+                nb = (char *)realloc(body, ncap);
+                if (!nb) break;
+                body = nb;
+                bcap = ncap;
+            }
+            if (!WinHttpReadData(r, body + blen, avail, &got) || got == 0) break;
+            blen += got;
+        }
+        if (body) body[blen] = '\0';
+        if (body && sy_json_get_bool(body, "ok", false)) {
+            if (out_skipped)
+                *out_skipped = sy_json_get_bool(body, "skipped", false);
+            sy_err(err, err_n, "");
+            ok = true;
+        } else {
+            sy_err(err, err_n, "phone rejected the file");
+        }
+done:
+        if (r) WinHttpCloseHandle(r);
+        if (c) WinHttpCloseHandle(c);
+        if (s) WinHttpCloseHandle(s);
+        free(body);
+        free(chunk);
+        fclose(f);
+        return ok;
+    }
+#endif
+}
+
+char *mn_sync_have(const char *host, int port, const char *hashes_csv) {
+#ifndef _WIN32
+    (void)host; (void)port; (void)hashes_csv;
+    return NULL;
+#else
+    char  *path;
+    char  *body;
+    size_t n;
+    if (!host || !host[0] || !hashes_csv || !hashes_csv[0]) return NULL;
+    if (port <= 0 || port > 65535) port = MN_SYNC_DEFAULT_PORT;
+    /* hashes are 16-hex + commas: already URL-safe, no encoding needed */
+    n = strlen(hashes_csv) + 32;
+    path = (char *)malloc(n);
+    if (!path) return NULL;
+    snprintf(path, n, "/sync/have?hashes=%s", hashes_csv);
+    body = sy_http_get_dyn(host, port, path);
+    free(path);
+    return body;
+#endif
+}
 
 /* ------------------------------------------------------------------ */
 /* Full sync flow (§4a)                                                */
@@ -892,59 +1495,63 @@ bool mn_sync_run(const mn_sync_env *env, const char *host, int port,
                  mn_sync_progress_cb cb, void *user) {
 #ifndef _WIN32
     (void)env; (void)host; (void)port;
-    if (cb) cb(user, "error", 0, 0, 0, "HTTP sync is Windows-only for now");
+    if (cb) cb(user, "error", 0, 0, 0, 0, 0, "HTTP sync is Windows-only for now");
     return false;
 #else
     char *body = NULL;
     char *mine = NULL;
-    int   applied = 0, skipped = 0, pushed = 0;
+    int   applied = 0, skipped = 0, pushed = 0, by_hash = 0, by_id = 0;
 
     if (!env || !env->lib || !host || !host[0]) {
-        if (cb) cb(user, "error", 0, 0, 0, "no sync host configured");
+        if (cb) cb(user, "error", 0, 0, 0, 0, 0, "no device selected");
         return false;
     }
     if (port <= 0 || port > 65535) port = MN_SYNC_DEFAULT_PORT;
 
     /* 1. ping: reachable + protocol == 1. */
-    if (cb) cb(user, "connecting", 0, 0, 0, "");
-    body = sy_http_req(host, port, "/sync/ping", NULL);
+    if (cb) cb(user, "connecting", 0, 0, 0, 0, 0, "");
+    body = sy_http_req(host, port, "/sync/ping", NULL, 10000);
     if (!body) {
-        if (cb) cb(user, "error", 0, 0, 0, "phone unreachable (is the sync server on?)");
+        if (cb) cb(user, "error", 0, 0, 0, 0, 0, "phone unreachable (is the sync server on?)");
         return false;
     }
     if (sy_json_get_i64(body, "protocol", -1) != MN_SYNC_PROTOCOL) {
         free(body);
-        if (cb) cb(user, "error", 0, 0, 0, "protocol mismatch — update the app(s)");
+        if (cb) cb(user, "error", 0, 0, 0, 0, 0, "protocol mismatch — update the app(s)");
         return false;
     }
     free(body);
 
     /* 2. pull the phone's snapshot and merge it into this library. */
-    if (cb) cb(user, "pulling", 0, 0, 0, "");
-    body = sy_http_req(host, port, "/sync/snapshot", NULL);
+    if (cb) cb(user, "pulling", 0, 0, 0, 0, 0, "");
+    /* 180 s: a cold or background-throttled phone measurably needs 30-120 s
+     * to build its snapshot (per-track hash-stamp stats, little-core
+     * cpuset when the screen is off) — 60 s failed real first syncs. */
+    body = sy_http_req(host, port, "/sync/snapshot", NULL, 180000);
     if (!body) {
-        if (cb) cb(user, "error", 0, 0, 0, "snapshot fetch failed");
+        if (cb) cb(user, "error", 0, 0, 0, 0, 0, "snapshot fetch failed");
         return false;
     }
-    if (cb) cb(user, "merging", 0, 0, 0, "");
-    if (!mn_sync_merge_snapshot(env, body, &applied, &skipped)) {
+    if (cb) cb(user, "merging", 0, 0, 0, 0, 0, "");
+    if (!mn_sync_merge_snapshot(env, body, &applied, &skipped,
+                                &by_hash, &by_id)) {
         free(body);
-        if (cb) cb(user, "error", 0, 0, 0, "merge failed (bad snapshot?)");
+        if (cb) cb(user, "error", 0, 0, 0, 0, 0, "merge failed (bad snapshot?)");
         return false;
     }
     free(body);
 
     /* 3. push our snapshot; the phone merges and reports its counts. */
-    if (cb) cb(user, "pushing", applied, skipped, 0, "");
+    if (cb) cb(user, "pushing", applied, skipped, 0, by_hash, by_id, "");
     mine = mn_sync_build_snapshot(env);
     if (!mine) {
-        if (cb) cb(user, "error", applied, skipped, 0, "local snapshot build failed");
+        if (cb) cb(user, "error", applied, skipped, 0, by_hash, by_id, "local snapshot build failed");
         return false;
     }
-    body = sy_http_req(host, port, "/sync/merge", mine);
+    body = sy_http_req(host, port, "/sync/merge", mine, 180000);
     free(mine);
     if (!body) {
-        if (cb) cb(user, "error", applied, skipped, 0, "push failed");
+        if (cb) cb(user, "error", applied, skipped, 0, by_hash, by_id, "push failed");
         return false;
     }
     /* Top-level "applied" precedes the nested merged snapshot (§4a); the
@@ -953,7 +1560,7 @@ bool mn_sync_run(const mn_sync_env *env, const char *host, int port,
     pushed = (int)sy_json_get_i64(body, "applied", 0);
     free(body);
 
-    if (cb) cb(user, "done", applied, skipped, pushed, "");
+    if (cb) cb(user, "done", applied, skipped, pushed, by_hash, by_id, "");
     return true;
 #endif
 }
@@ -1020,7 +1627,8 @@ bool mn_sync_import_file(const mn_sync_env *env, const char *path,
         free(json);
         return false;
     }
-    ok = mn_sync_merge_snapshot(env, json, out_applied, out_skipped);
+    ok = mn_sync_merge_snapshot(env, json, out_applied, out_skipped,
+                                NULL, NULL);
     free(json);
     return ok;
 }
