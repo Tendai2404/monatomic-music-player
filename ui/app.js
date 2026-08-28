@@ -63,6 +63,13 @@
   }
 
   const STEM_NAMES = ["Sub Bass", "Bass", "Vocals", "Lead", "Instruments", "Wide", "Air", "Guitar", "Piano"];
+  /* DISPLAY order of the mixer, as channel indices. Vocals leads: it is the
+     channel people actually reach for (karaoke, a cappella, ducking a lead),
+     so it belongs under the cursor first rather than third.
+     These are ENGINE CHANNEL indices and the array only reorders the DOM —
+     every {cmd:"stems", i} still carries the channel's real index, and
+     faderEls stays keyed BY that index, so nothing downstream shifts. */
+  const STEM_ORDER = [2, 0, 1, 3, 4, 5, 6, 7, 8];
   const VIEW_TITLES = ["Tracks", "Albums", "Artists", "Genres", "Folders", "Playlists"];
 
   /* ============================================================
@@ -6802,7 +6809,8 @@
   }
   function buildFaders() {
     E.stemFaders.innerHTML = ""; faderEls.length = 0;
-    for (let i = 0; i < 9; i++) {
+    /* built in DISPLAY order, but indexed by CHANNEL — see STEM_ORDER */
+    for (const i of STEM_ORDER) {
       const root = el("div", "fader");
       root.dataset.group = STEM_GROUPS[i];
       const name = el("div", "fader-name");
@@ -6930,7 +6938,10 @@
         stemSetSolo(i, !rec.soloed);
         syncStemPresetChips();
       });
-      faderEls.push(rec);
+      /* keyed by channel index, NOT by build position: every consumer
+         (stemSetMute/stemSetSolo/setFaderGain, the presets, the meters)
+         looks a channel up as faderEls[i], and `i` is the engine's index. */
+      faderEls[i] = rec;
       E.stemFaders.appendChild(root);
       setFaderGain(rec, i, 100, false);   /* engine default gain is 1.0 */
     }
@@ -7643,7 +7654,9 @@
       prow.appendChild(rst); }
 
     const frag = document.createDocumentFragment();
-    for (let i = 0; i < faderEls.length; i++) {
+    /* same DISPLAY order as the dock — the two mixers must not disagree
+       about which column is which channel */
+    for (const i of STEM_ORDER) {
       const cell = msBuildChannel(i);
       if (cell) frag.appendChild(cell);
     }
