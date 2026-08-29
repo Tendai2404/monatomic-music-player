@@ -3,7 +3,9 @@
    Multi-provider lyric fetching (LRCLIB → Genius → AZLyrics →
    SongLyrics → Lyrics.com → Letras) with adaptive per-host rate
    limiting, UA rotation, a worker-pool batch fetcher, synced
-   .lrc support, and a now-playing overlay with auto-scroll.
+   .lrc support, and the LIVE karaoke section that sits inline in
+   the now-playing panel below the album art + spectrum
+   (#np-lyrics-live — see the "LIVE LYRICS" block below).
 
    app.js boots this via MnLyrics.init(api) and opens the view
    via MnLyrics.open(api) — the same pattern as models.js.
@@ -376,6 +378,25 @@ window.MnLyrics = (function () {
       const rec = store[t.id] = { text: String(m.text), source: "file", status: "skip", existing: true };
       if (looksLrc(rec.text)) rec.lrc = rec.text;
       updateRow(t.id);
+      /* TIMESTAMP UPGRADE. Plenty of files ship EMBEDDED lyrics with no
+         timestamps, and returning here meant those tracks could never
+         follow playback — the now-playing panel would sit on a dead block
+         of text forever even when LRCLIB has a synced copy. Try ONCE for a
+         timed version, keeping the embedded text as the fallback so this
+         can only ever improve on what the file already had. */
+      if (rec.lrc || rec.syncTried) return rec;
+      rec.syncTried = true;
+      try {
+        const timed = await runProviders(t);
+        if (timed && timed.lrc) {
+          rec.lrc = timed.lrc;
+          rec.text = timed.text || rec.text;
+          rec.source = timed.source;
+          rec.status = "found";
+          writeLyrics(t.id, rec);      /* persists the .lrc sidecar */
+        }
+      } catch (_) { /* keep the embedded copy */ }
+      updateRow(t.id);
       return rec;
     }
     const rec = store[t.id] || (store[t.id] = {});
@@ -636,110 +657,287 @@ window.MnLyrics = (function () {
   }
 
   /* ============================================================
-     NOW-PLAYING OVERLAY — compact Lyrics button after .np-meta;
-     synced .lrc auto-scrolls and highlights the current line.
+     LIVE LYRICS — the permanent inline section of the now-playing
+     panel (#np-lyrics-live in index.html), sitting directly BELOW
+     the album art and the spectrum and ABOVE the online card and
+     the queue. It populates itself on every track change; the old
+     absolute .np-lyrics overlay it replaces is gone.
+
+     IDLE-CPU CONTRACT (the app holds ~1% idle and must keep it):
+     there is NO timer here. The karaoke follower rides app.js's
+     playhead rAF loop through B.addTick / B.removeTick, and that
+     loop already parks itself whenever nothing is playing. On top
+     of that we only stay subscribed while there is genuinely
+     something to advance — see npWantFollow(). The per-frame body
+     (npTick) is one getPos() and two numeric compares until the
+     ACTIVE LINE actually changes; the DOM is touched only then.
      ============================================================ */
-  let npBtn = null, npOv = null, npBody = null, npTitleEl = null, npPillEl = null;
-  let npTimer = 0, npTrackId = null, npLines = null, npLineEls = null, npCurLine = -1;
+  const NP_OPEN_KEY = "mn.lyrics.np.open";
+  const NP_LEAD_MS  = 120;      /* fire a line slightly early — reads on-beat */
+  const NP_MAX_LINES = 900;     /* node cap for pathological .lrc files       */
+  const NP_FETCH_DELAY = 280;   /* debounce: skipping tracks must not spam
+                                   the provider chain (LRCLIB → … → Letras)  */
 
-  function buildNp() {
-    const np = $("#nowplaying");
-    if (!np) return;
-    const meta = $(".np-meta", np);
-    npBtn = el("button", "np-lyr-btn", "♪  Lyrics");
-    if (meta) meta.insertAdjacentElement("afterend", npBtn); else np.appendChild(npBtn);
+  let npSec = null, npBtn = null, npPillEl = null, npBody = null;
+  let npOpen = true;            /* persisted collapse/expand choice           */
+  let npGen = 0;                /* fetch generation — kills stale renders     */
+  let npKey = null;             /* identity of the track the section shows    */
+  let npFetchTimer = 0;
+  let npLines = null;           /* parsed [{t,text}] for synced lyrics, else null */
+  let npLineEls = null;
+  let npCur = -1;               /* active line index                          */
+  let npLo = 0, npHi = 0;       /* [lo,hi) ms window the active line owns     */
+  let npFollowing = false;      /* currently subscribed to the rAF loop       */
 
-    npOv = el("div", "np-lyrics");
-    npOv.hidden = true;
-    const head = el("div", "np-lyr-head");
-    npTitleEl = el("div", "np-lyr-title", "Lyrics");
-    npPillEl = el("span", "pill synced", "SYNCED");
-    npPillEl.hidden = true;
-    const close = el("button", "btn btn-ghost np-lyr-close", "✕");
-    close.addEventListener("click", closeNp);
-    head.appendChild(npTitleEl); head.appendChild(npPillEl); head.appendChild(close);
-    npBody = el("div", "np-lyr-body");
-    npOv.appendChild(head); npOv.appendChild(npBody);
-    np.appendChild(npOv);
-
-    npBtn.addEventListener("click", () => { if (npOv.hidden) openNp(); else closeNp(); });
-
-    /* follow track changes while the overlay is open */
-    B.tap("now", (m) => {
-      if (!npOv || npOv.hidden || !m) return;
-      if (m.track_id != null && m.track_id !== npTrackId) openNp();
-    });
+  function npReduced() {
+    const mo = window.MN && MN.get && MN.get("motion");
+    if (mo && mo.reduced) { try { return !!mo.reduced(); } catch (_) {} }
+    return document.documentElement.classList.contains("no-anim") ||
+           !!(window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches);
   }
 
-  function closeNp() {
-    /* karaoke follower stops IMMEDIATELY; the panel itself exits through
-       the motion system (symmetric to its fade-in — .np-lyrics.mo-out) */
-    if (npTimer) { clearInterval(npTimer); npTimer = 0; }
-    if (npOv && !npOv.hidden) {
-      const mo = window.MN && MN.get("motion");
-      if (mo && mo.close) mo.close(npOv, () => { npOv.hidden = true; });
-      else npOv.hidden = true;
-    }
+  /* ---------- follower subscription (the whole idle story) ----------
+     ONE geometric test covers every way the section can be out of sight, so
+     no future CSS can leave the follower running over nothing:
+       · display:none from the mini/micro tier rules
+       · display:none from the @media (max-height:799px) short-window rule
+       · the whole #nowplaying column sliding out under @media (max-width:1180px)
+       · the user collapsing the panel (#app.np-collapsed -> zero-width track)
+       · hidden="" for radio/podcast sessions
+     It is a single getBoundingClientRect, and it runs only when something
+     actually changed (see the triggers wired in buildNp) — never per frame. */
+  function npOnScreen() {
+    if (!npSec || npSec.hidden) return false;
+    const r = npSec.getBoundingClientRect();
+    return r.width > 8 && r.height > 0 &&
+           r.right > 0 && r.left < (window.innerWidth || 0) &&
+           r.bottom > 0 && r.top < (window.innerHeight || 0);
+  }
+  function npWantFollow() {
+    return !!(npLines && npLines.length && npOpen &&
+              typeof B.addTick === "function" && npOnScreen());
+  }
+  function npSyncFollow() {
+    const want = npWantFollow();
+    if (want === npFollowing) return;
+    npFollowing = want;
+    if (want) B.addTick(npTick); else if (B.removeTick) B.removeTick(npTick);
+  }
+  /* re-evaluate after something that can change visibility, and re-centre if
+     the section just came back (its scroll box had no layout while hidden) */
+  function npRevisit() {
+    const was = npFollowing;
+    npSyncFollow();
+    if (npFollowing && !was && npLines) npPaint(npLocate(B.getPos().pos + NP_LEAD_MS), true);
   }
 
-  async function openNp() {
-    if (!npOv) return;
-    npOv.hidden = false;
-    npPillEl.hidden = true;
-    if (npTimer) { clearInterval(npTimer); npTimer = 0; }
-    npLines = null; npLineEls = null; npCurLine = -1;
-    const now = B.getNow();
-    if (!now || !now.track_title) {
-      npTitleEl.textContent = "Lyrics";
-      npBody.textContent = "Nothing playing.";
-      npTrackId = null;
-      return;
-    }
-    npTrackId = now.track_id != null ? now.track_id : null;
-    npTitleEl.textContent = now.track_title;
-    npBody.textContent = "Fetching lyrics…";
-    const t = trackForNow(now);
-    const rec = await getLyricsFor(t);
-    const cur = B.getNow();
-    if (npOv.hidden || !cur || (cur.track_id != null && cur.track_id !== npTrackId)) return;
-    if (!rec || !rec.text) { npBody.textContent = "No lyrics found for this track."; return; }
-    renderNp(rec);
+  /* last line whose timestamp is <= pos (binary search — a seek to the end
+     of a 200-line .lrc costs 8 compares, not 200) */
+  function npLocate(pos) {
+    const L = npLines;
+    if (!L || !L.length || pos < L[0].t) return -1;
+    let lo = 0, hi = L.length - 1;
+    while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (L[mid].t <= pos) lo = mid; else hi = mid - 1; }
+    return lo;
   }
 
-  function renderNp(rec) {
-    npBody.innerHTML = "";
-    npPillEl.hidden = !rec.lrc;
-    if (rec.lrc) {
-      npLines = parseLrc(rec.lrc);
-      if (npLines.length) {
-        npLineEls = npLines.map((L) => {
-          const d = el("div", "lyr-line", L.text || "♪");
-          npBody.appendChild(d);
-          return d;
-        });
-        npCurLine = -1;
-        npTimer = setInterval(syncNp, 200);
-        syncNp();
+  /* THE per-frame body. Everything before the early-out is two numbers. */
+  function npTick() {
+    if (!npLines) return;
+    const pos = B.getPos().pos + NP_LEAD_MS;
+    if (pos >= npLo && pos < npHi) return;      /* still on the same line */
+    npPaint(npLocate(pos), false);
+  }
+
+  function npPaint(idx, force) {
+    const L = npLines;
+    if (!L) return;
+    npLo = idx >= 0 ? L[idx].t : -Infinity;
+    /* skip over any lines sharing this timestamp so the window is never
+       zero-width (that would re-search every single frame) */
+    let j = idx + 1;
+    while (j < L.length && L[j].t <= npLo) j++;
+    npHi = j < L.length ? L[j].t : Infinity;
+    if (idx === npCur && !force) return;
+    /* a SEEK is anything that is not "the very next line": jump straight
+       there instead of smooth-scrolling through everything in between */
+    const jumped = !!force || npCur < 0 || idx < npCur || idx > npCur + 1;
+    if (npCur >= 0 && npLineEls && npLineEls[npCur]) npLineEls[npCur].classList.remove("on");
+    npCur = idx;
+    if (idx < 0 || !npLineEls || !npLineEls[idx]) { npScrollTo(null, true); return; }
+    npLineEls[idx].classList.add("on");
+    npScrollTo(npLineEls[idx], jumped);
+  }
+
+  /* keep the active line centred INSIDE .npl-body only — computed directly
+     rather than via scrollIntoView, which would also scroll ancestors */
+  function npScrollTo(node, instant) {
+    if (!npBody) return;
+    if (!node) { npBody.scrollTop = 0; return; }
+    const target = Math.max(0, node.offsetTop - (npBody.clientHeight - node.offsetHeight) / 2);
+    if (instant || npReduced() || !npBody.scrollTo) npBody.scrollTop = target;
+    else npBody.scrollTo({ top: target, behavior: "smooth" });
+  }
+
+  /* ---------- rendering ---------- */
+  function npReset() {
+    npLines = null; npLineEls = null; npCur = -1; npLo = 0; npHi = 0;
+    if (npBody) npBody.textContent = "";
+    if (npPillEl) npPillEl.hidden = true;
+  }
+
+  /* the "nothing to say" state: ONE dim line, no pill, no follower */
+  function npQuiet(msg) {
+    npReset();
+    if (!npBody) return;
+    npBody.classList.add("npl-hush");
+    npBody.appendChild(el("div", "npl-quiet", msg));
+    npSyncFollow();
+  }
+
+  function npRender(rec) {
+    npReset();
+    if (!npBody) return;
+    if (!rec || !rec.text) { npQuiet("No lyrics for this track."); return; }
+    npBody.classList.remove("npl-hush");
+    const lrc = rec.lrc || (looksLrc(rec.text) ? rec.text : "");
+    if (lrc) {
+      const lines = parseLrc(lrc);
+      if (lines.length) {
+        npLines = lines.length > NP_MAX_LINES ? lines.slice(0, NP_MAX_LINES) : lines;
+        const frag = document.createDocumentFragment();
+        /* textContent only — provider text is remote data */
+        npLineEls = npLines.map((L) => { const d = el("div", "lyr-line", L.text || "♪"); frag.appendChild(d); return d; });
+        npBody.appendChild(frag);
+        npPillEl.hidden = false;
+        npBody.scrollTop = 0;
+        npPaint(npLocate(B.getPos().pos + NP_LEAD_MS), true);
+        npSyncFollow();
         return;
       }
     }
-    npBody.appendChild(el("div", "lyr-plain", rec.text));
+    /* plain lyrics: scrollable, no highlight, and the pill says so */
+    npPillEl.hidden = false;
+    npPillEl.classList.remove("synced");
+    npPillEl.classList.add("plain");
+    npPillEl.textContent = "UNSYNCED";
+    npPillEl.title = "No timestamps for this track — the text does not follow playback";
+    npBody.appendChild(el("div", "lyr-plain", stripLrc(rec.text)));
+    npBody.scrollTop = 0;
+    npSyncFollow();               /* -> unsubscribes: nothing to advance */
   }
 
-  function syncNp() {
-    if (!npOv || npOv.hidden || !npLines || !npLineEls) return;
-    const pos = B.getPos().pos;
-    let idx = -1;
-    for (let i = 0; i < npLines.length; i++) {
-      if (npLines[i].t <= pos + 120) idx = i; else break;
+  function npResetPill() {
+    if (!npPillEl) return;
+    npPillEl.classList.add("synced");
+    npPillEl.classList.remove("plain");
+    npPillEl.textContent = "SYNCED";
+    npPillEl.title = "Timestamped lyrics — following playback live";
+  }
+
+  /* ---------- track changes ---------- */
+  function npLoad(m) {
+    const gen = ++npGen;
+    if (npFetchTimer) { clearTimeout(npFetchTimer); npFetchTimer = 0; }
+    npResetPill();
+
+    /* internet radio / podcasts have no track to look up */
+    if (!m || m.online || !m.track_title) {
+      npReset();
+      if (npBody) npBody.classList.add("npl-hush");
+      if (npSec) npSec.hidden = true;
+      npSyncFollow();
+      return;
     }
-    if (idx === npCurLine) return;
-    if (npCurLine >= 0 && npLineEls[npCurLine]) npLineEls[npCurLine].classList.remove("on");
-    npCurLine = idx;
-    if (idx >= 0 && npLineEls[idx]) {
-      npLineEls[idx].classList.add("on");
-      npLineEls[idx].scrollIntoView({ block: "center", behavior: "smooth" });
+    if (npSec) npSec.hidden = false;
+
+    const t = trackForNow(m);
+    const rec = store[t.id];
+    if (rec && rec.text) { npRender(rec); return; }          /* already cached */
+    if (rec && rec.status === "fail") { npQuiet("No lyrics for this track."); return; }
+
+    npQuiet("Looking for lyrics…");
+    npFetchTimer = setTimeout(() => {
+      npFetchTimer = 0;
+      if (gen !== npGen) return;
+      getLyricsFor(t).then(
+        (r) => { if (gen === npGen) npRender(r); },
+        ()  => { if (gen === npGen) npQuiet("No lyrics for this track."); }
+      );
+    }, NP_FETCH_DELAY);
+  }
+
+  /* Identity of what is on screen. track_id alone is not enough: online
+     sessions and the "nothing playing" state both carry no usable id. */
+  function npIdentity(m) {
+    if (!m || !m.track_title) return "none";
+    if (m.online) return "online";
+    return (m.track_id != null ? m.track_id : "?") + " " + m.track_title;
+  }
+
+  function npOnNow(m) {
+    if (!npSec) return;
+    const key = npIdentity(m);
+    if (key !== npKey) { npKey = key; npLoad(m); return; }
+    /* SAME track. While PAUSED the rAF loop is parked, so a seek made from
+       the seekbar/keyboard would leave the highlight stale — resync off the
+       existing now poll instead of keeping a timer alive. Costs the tick
+       body (getPos + two compares) and only while a synced track is up. */
+    if (npFollowing && m && !m.playing) npTick();
+  }
+
+  /* ---------- collapse / expand ---------- */
+  function npSetOpen(open, persist) {
+    npOpen = !!open;
+    if (npSec) npSec.classList.toggle("collapsed", !npOpen);
+    if (npBtn) {
+      npBtn.setAttribute("aria-expanded", npOpen ? "true" : "false");
+      npBtn.classList.toggle("on", npOpen);
     }
+    if (persist) { try { localStorage.setItem(NP_OPEN_KEY, npOpen ? "1" : "0"); } catch (_) {} }
+    npSyncFollow();
+    /* re-centre on expand — the body had no layout while collapsed */
+    if (npOpen && npLines) npPaint(npLocate(B.getPos().pos + NP_LEAD_MS), true);
+  }
+
+  function buildNp() {
+    npSec    = $("#np-lyrics-live");
+    npBtn    = $("#npl-toggle");
+    npPillEl = $("#npl-pill");
+    npBody   = $("#npl-body");
+    if (!npSec || !npBody) return;
+
+    try { npOpen = localStorage.getItem(NP_OPEN_KEY) !== "0"; } catch (_) { npOpen = true; }
+    npSetOpen(npOpen, false);                  /* default EXPANDED */
+    if (npBtn) npBtn.addEventListener("click", () => npSetOpen(!npOpen, true));
+
+    /* VISIBILITY TRIGGERS. Each fires only on a real change — no polling,
+       no timers, nothing at idle — and each just re-runs npOnScreen():
+         · data-ui-tier on <html>   — the mini/micro widget tiers
+         · class on #app            — the user collapsing the panel
+         · one matchMedia listener  — the two breakpoints that hide it */
+    if (window.MutationObserver) {
+      const mo = new MutationObserver(npRevisit);
+      mo.observe(document.documentElement, { attributes: true, attributeFilter: ["data-ui-tier"] });
+      const app = $("#app");
+      if (app) mo.observe(app, { attributes: true, attributeFilter: ["class"] });
+    }
+    if (window.matchMedia) {
+      const mq = matchMedia("(max-height:799px),(max-width:1180px)");
+      if (mq.addEventListener) mq.addEventListener("change", npRevisit);
+      else if (mq.addListener) mq.addListener(npRevisit);
+    }
+
+    /* rAF is frozen while the document is hidden, so the follower simply
+       does not run; re-centre once when we come back. */
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden && npLines && npOpen) {
+        npPaint(npLocate(B.getPos().pos + NP_LEAD_MS), true);
+      }
+    });
+
+    B.tap("now", npOnNow);
+    npOnNow(B.getNow());
   }
 
   /* ============================================================
@@ -765,14 +963,18 @@ window.MnLyrics = (function () {
     renderPreview();
   }
 
-  /* toggle the synced now-playing lyrics overlay (player-bar LYR pill) */
+  /* Player-bar LYR pill: the live section is always present now, so the pill
+     collapses/expands it (and scrolls it into view when it re-opens). */
   function toggleNp() {
-    if (!npOv) return;
-    if (npOv.hidden) openNp(); else closeNp();
+    if (!npSec) return;
+    npSetOpen(!npOpen, true);
+    if (npOpen && npSec.scrollIntoView && !npSec.hidden) {
+      npSec.scrollIntoView({ block: "nearest", behavior: npReduced() ? "auto" : "smooth" });
+    }
   }
 
   return { init, open, toggleNp };
 })();
 
 /* module registry: expose this file as an independent block */
-if (window.MN) MN.define("lyrics", "1.1.0", [], function () { return window.MnLyrics || {}; });
+if (window.MN) MN.define("lyrics", "1.2.0", [], function () { return window.MnLyrics || {}; });

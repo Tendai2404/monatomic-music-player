@@ -1456,21 +1456,59 @@ body.resizing-row{user-select:none; cursor:row-resize}
 .lyr-save{height:32px}
 .lyr-pv-status{font-size:11.5px;font-weight:600;color:var(--muted)}
 
-/* ---------- now-playing lyrics button + overlay ---------- */
+/* ---------- LIVE LYRICS: inline now-playing section ----------
+   #np-lyrics-live is a NORMAL IN-FLOW block of the #nowplaying flex column,
+   placed between .np-meta (art + title + spectrum) and #np-online. It never
+   overlays the cover — the old absolute .np-lyrics overlay is gone.
+
+   flex:0 8 auto — it does not grow, but it gives way EIGHT times as readily
+   as its siblings when the panel gets short, so "Up Next" and the queue are
+   never pushed out of the panel. The art (flex:none) never moves. */
 #nowplaying{position:relative}
-.np-lyr-btn{align-self:flex-start;height:28px;padding:0 13px;border-radius:14px;
+#np-lyrics-live{display:flex;flex-direction:column;gap:8px;flex:0 8 auto;min-height:0}
+/* an id selector outranks the UA's [hidden]{display:none} — restore it */
+#np-lyrics-live[hidden]{display:none}
+.npl-head{display:flex;align-items:center;gap:8px;flex:none;min-width:0}
+.np-lyr-btn{align-self:center;height:28px;padding:0 13px;border-radius:14px;flex:none;
   background:var(--raised);border:1px solid var(--line);color:var(--text-dim);
   font-size:11.5px;font-weight:700;letter-spacing:.04em;
   transition:background var(--t),border-color var(--t),color var(--t),box-shadow var(--t)}
 .np-lyr-btn:hover{background:var(--raised-2);color:var(--accent);border-color:color-mix(in srgb, var(--accent) 40%, transparent);
   box-shadow:0 0 12px color-mix(in srgb, var(--accent) 14%, transparent)}
-.np-lyrics{position:absolute;inset:0;z-index:8;display:flex;flex-direction:column;gap:10px;
-  padding:18px 16px 14px;background:linear-gradient(180deg,var(--panel),var(--panel-2));animation:fade .2s var(--ease)}
-.np-lyr-head{display:flex;align-items:center;gap:8px;flex:none}
-.np-lyr-title{flex:1;font-size:14px;font-weight:800;letter-spacing:-.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.np-lyr-close{height:28px;width:28px;font-size:13px;flex:none}
-.np-lyr-body{flex:1;overflow-y:auto;min-height:0;user-select:text;padding-right:6px;scroll-behavior:smooth}
-.lyr-plain{font-size:13px;line-height:1.7;color:var(--text-dim);white-space:pre-wrap}
+/* expanded / collapsed state on the toggle — same accent idiom as .chip.on */
+.np-lyr-btn.on{color:var(--accent);border-color:color-mix(in srgb, var(--accent) 32%, transparent)}
+.npl.collapsed .npl-body{display:none}
+.npl.collapsed .np-lyr-btn{opacity:.72}
+/* The scroll box. max-height (not height) so the quiet/short states collapse
+   to their content instead of leaving a hole in the panel.
+   clamp(88px, 17vh, 216px): 17vh is ~7 lines at a 900px-tall window — enough
+   context either side of the active line to read ahead — and the 216px
+   ceiling stops a 4K window from handing the whole panel to lyrics.
+   position:relative anchors offsetTop for the JS centring in lyrics.js. */
+.npl-body{position:relative;max-height:clamp(88px,17vh,216px);min-height:0;
+  overflow-y:auto;overscroll-behavior:contain;user-select:text;
+  padding:2px 6px 2px 11px;border-left:1px solid var(--line)}
+.npl-body.npl-hush{border-left-color:transparent;padding-left:0}
+.npl-quiet{font-size:11.5px;font-weight:600;color:var(--muted-2);padding:1px 0}
+/* SHORT WINDOWS. The panel is art(260) + meta(130) + "Up Next" + queue and is
+   already tight below ~780px tall; a section that has been squeezed to zero
+   still costs the column's 16px gap and its own 28px toggle row, which is the
+   one case where lyrics could push the queue out of the panel. Measured with
+   a headless layout harness: at 100vh-216 of panel, 800 is the smallest
+   window that still leaves the lyric box a whole line. Below it the section
+   goes away entirely (the sidebar Lyrics view still has everything), and
+   lyrics.js stops the follower because the section is display:none. */
+@media (max-height:799px){#np-lyrics-live{display:none}}
+/* Above it, ramp a floor under the queue so "Up Next" keeps real rows once
+   there is height to spare: 0 at a 812px window (the lyric box is the scarce
+   thing there and it is the one that scrolls), rising to ~3 rows by 900px.
+   Raising the queue's minimum pushes the flex deficit onto the lyric box,
+   which shrinks gracefully because it scrolls — the queue never gets pushed
+   out of the panel. Verified across 620–2160px with a layout harness. */
+.np-queue{min-height:clamp(0px,calc(100vh - 812px),88px)}
+/* plain (unsynced) lyrics: readable, scrollable, no highlight */
+.lyr-plain{font-size:12.5px;line-height:1.65;color:var(--text-dim);white-space:pre-wrap}
+.pill.plain{background:var(--raised);color:var(--muted);border-color:var(--line-strong)}
 .lyr-line{padding:4px 9px;border-radius:6px;font-size:13px;line-height:1.55;color:var(--muted);
   transition:color .25s var(--ease),background .25s var(--ease),transform .25s var(--ease)}
 .lyr-line.on{color:var(--text);font-weight:700;background:color-mix(in srgb, var(--accent) 11%, transparent);
@@ -2806,8 +2844,6 @@ html:not([data-mo-micro="off"]) .tbtn.thumb.on{animation:mn-pop 340ms var(--ease
 .mo-out .eq-panel,.mo-out .help-panel,.mo-out .modal,.mo-out .mm-review-card{
   animation:mn-panel-out 200ms var(--ease) both}
 .pl-picker.mo-out{animation:mn-panel-out 180ms var(--ease) both;pointer-events:none}
-/* np-lyrics panel: symmetric fade-out to its fade-in */
-.np-lyrics.mo-out{animation:mn-overlay-out 160ms var(--ease) both;pointer-events:none}
 /* context menu root: quick graceful vanish (submenus drop instantly) */
 .mn-ctx.mo-out{animation:mn-panel-out 140ms var(--ease) both;pointer-events:none}
 html[data-mo-overlay="fade"] .mo-out .eq-panel,
@@ -3890,26 +3926,27 @@ html[data-ui-tier="micro"] #app #nowplaying{
 }
 
 /* everything in the panel that is not the cover or the track text.
-   .np-lyr-btn / .np-lyrics are INJECTED into #nowplaying by lyrics.js
-   (buildNp: the "♪ Lyrics" button is inserted right after .np-meta). With
-   the panel on display:contents they became direct grid items of #app and
-   the button landed under the seek bar as a stray bar across the bottom of
-   the widget. They are full-window affordances — hidden here with the rest
-   of the panel's chrome. */
+   #np-lyrics-live (the live lyrics section, between .np-meta and #np-online)
+   and its .np-lyr-btn toggle are full-window affordances: with the panel on
+   display:contents they become direct grid items of #app and would land
+   under the seek bar as stray bars across the bottom of the widget. They are
+   hidden here with the rest of the panel's chrome — and lyrics.js watches
+   data-ui-tier so the karaoke follower unsubscribes from the rAF loop at the
+   same moment (a hidden section must not cost a single frame). */
 html[data-ui-tier="mini"]  #app #np-spectrum,
 html[data-ui-tier="mini"]  #app #np-online,
 html[data-ui-tier="mini"]  #app .np-queue-head,
 html[data-ui-tier="mini"]  #app #np-queue,
 html[data-ui-tier="mini"]  #app .np-art-max,
 html[data-ui-tier="mini"]  #app .np-lyr-btn,
-html[data-ui-tier="mini"]  #app .np-lyrics,
+html[data-ui-tier="mini"]  #app #np-lyrics-live,
 html[data-ui-tier="micro"] #app #np-spectrum,
 html[data-ui-tier="micro"] #app #np-online,
 html[data-ui-tier="micro"] #app .np-queue-head,
 html[data-ui-tier="micro"] #app #np-queue,
 html[data-ui-tier="micro"] #app .np-art-max,
 html[data-ui-tier="micro"] #app .np-lyr-btn,
-html[data-ui-tier="micro"] #app .np-lyrics{display:none}
+html[data-ui-tier="micro"] #app #np-lyrics-live{display:none}
 
 /* ---- the cover ------------------------------------------------------
    The volumetric WebGL mesh and the CSS tilt are both switched OFF in the

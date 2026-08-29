@@ -392,6 +392,20 @@
       <div id="np-album" class="np-album">—</div>
       <canvas id="np-spectrum" class="np-spectrum" width="480" height="64"></canvas>
     </div>
+    <!-- Live lyrics — karaoke follower. Sits directly BELOW the art and the
+         spectrum and ABOVE the online card + queue, as a normal in-flow block
+         with its own bounded scroll (see #np-lyrics-live in styles.css).
+         Populated and driven entirely by ui/lyrics.js; the shell is static so
+         the DOM order and the size-tier rules never depend on JS timing. -->
+    <section id="np-lyrics-live" class="npl" hidden>
+      <div class="npl-head">
+        <button id="npl-toggle" class="np-lyr-btn" type="button"
+                aria-expanded="true" aria-controls="npl-body"
+                title="Collapse / expand the live lyrics">♪  Lyrics</button>
+        <span id="npl-pill" class="pill synced" hidden>SYNCED</span>
+      </div>
+      <div id="npl-body" class="npl-body"></div>
+    </section>
     <!-- Online session card: radio "recently played" (live ICY log) /
          podcast episode notes. Filled by app.js; hidden for library play. -->
     <div id="np-online" class="np-online" hidden></div>

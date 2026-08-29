@@ -4274,7 +4274,7 @@
     }
     if (tid != null && lyrHas[tid]) {
       const lp = el("span", "pill lyr clickable", "LYR");
-      lp.title = "Lyrics available — click for live synced lyrics";
+      lp.title = "Lyrics available — click to collapse/expand the live lyrics in the now-playing panel";
       lp.addEventListener("click", () => {
         if (window.MnLyrics && MnLyrics.toggleNp) MnLyrics.toggleNp();
       });
@@ -4438,6 +4438,17 @@
     if (!rafActive) { rafActive = true; requestAnimationFrame(tick); }
   }
 
+  /* ---- per-frame subscribers for UI modules (lyrics.js karaoke follower) --
+     A module that has to follow the playhead should ride THIS loop instead of
+     starting a timer of its own: the loop already parks whenever nothing is
+     playing (loopNeeded), so a subscriber inherits the "no work at idle"
+     contract for free. An empty list costs one .length read per frame, and
+     the loop is not running at all when idle. Subscribers must be cheap and
+     must unsubscribe the moment they have nothing to advance. */
+  const tickSubs = [];
+  function addTick(fn) { if (typeof fn === "function" && tickSubs.indexOf(fn) < 0) tickSubs.push(fn); }
+  function removeTick(fn) { const i = tickSubs.indexOf(fn); if (i >= 0) tickSubs.splice(i, 1); }
+
   function tick(t) {
     if (!loopNeeded()) {
       rafActive = false;      /* park — poll() / pointer re-arms */
@@ -4465,6 +4476,11 @@
     }
     smoothMeters(t || performance.now());
     tickArt(t || performance.now());
+    if (tickSubs.length) {
+      for (let i = 0; i < tickSubs.length; i++) {
+        try { tickSubs[i](); } catch (err) { console.error("tickSub", err); }
+      }
+    }
     requestAnimationFrame(tick);
   }
 
@@ -7799,6 +7815,9 @@
     requestMoreTracks: loadTracks,
     getNow: () => state.now,
     getPos: currentPos,
+    /* Ride the shared playhead rAF loop (parks when nothing is playing).
+       See addTick/removeTick above — do NOT start a private timer. */
+    addTick, removeTick,
     /* Drive the search box + view from code ("Find more from same…"). */
     setSearch: (q) => runSearch(q),
     /* ENTITY navigation for modules' context menus. These go through the
